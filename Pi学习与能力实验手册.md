@@ -835,8 +835,10 @@ typed → dispatched → transport_acknowledged
 - 2026-07-31 在本地个人版 Pi 0.83.0 上完成正式 T1：精确安装、三种 trust 路径、运行态和卸载均通过；
 - `pi remove` 不会物理恢复安装前状态：会留下空 `packages` 数组及 `~/.pi/agent/npm` 管理目录，必须依靠快照恢复和残留隔离。
 - 2026-07-31 与 Context7 3.2.5 组成真实用途链：指定版本官方文档查询通过；错误版本和离线失败可被模型识别，但 Adapter 将这些失败返回为 `isError=false`，离线路径还出现 `agent_settled` 后进程延迟退出。
+- 后续诊断证明进程问题由测试配置中的 `cmd /c npx` 包装层引起：Adapter 只对顶层 `npx`/`npm` 做直接二进制解析；相同超时 fixture 直接启动 Node 时完整回收，经 `cmd /c` 启动时孙进程残留。
+- 使用固定本地 Context7 3.2.5 的 `dist/index.js` 并由 Node 直接启动后，正常查询、错误版本和离线三条真实链均完成且 Context7 PID 无残留。
 
-状态：P08 单组件 T1 通过，P08→M01 功能主链通过，但组合韧性门未通过，未获长期保留资格。下一步先定位失败语义和进程回收边界，再重复同一真实用途链；测试时仍只临时恢复 Adapter，并执行完整快照回滚。
+状态：P08 单组件 T1 和 P08→M01 条件化韧性复验均通过，可以申请 R1。长期配置不得使用 `cmd /c npx`；应把 Context7 固定安装到稳定位置，并由 Node 直接启动。未经用户另行批准仍不长期安装。
 
 ### MCP-03｜Context7
 
@@ -845,7 +847,7 @@ typed → dispatched → transport_acknowledged
 - [#3](https://x.com/systemdesignone/status/2079182252366340510)
 - [#23](https://x.com/HiTw93/status/2039713457952706686)
 
-候选：`@upstash/context7-mcp@3.2.5`。2026-07-31 已通过 Pi→Adapter→Context7 的真实版本文档查询，命中 Next.js 15.1.11 官方源码文档；错误版本能返回明确可用版本列表，离线能返回连接超时。当前不足是错误版本、连接超时和服务器退避均以 `isError=false` 返回，且离线测试在 `agent_settled` 后没有立即退出。状态为 `hold`：不长期安装，先诊断 Adapter 错误语义和 Windows 子进程回收，再重复完整用途链。
+候选：`@upstash/context7-mcp@3.2.5`。2026-07-31 已通过 Pi→Adapter→Context7 的真实版本文档查询，命中 Next.js 15.1.11 官方源码文档。诊断确认 Context7 会把错误版本和网络失败包装成普通 MCP 文本结果，因此 `isError=false` 是其当前 Server 合同，不是 Adapter 丢失远端错误标志；模型在两类测试中均正确识别错误且没有回退。使用 Node 直接启动固定版本后，正常查询约 42.6 秒、错误版本约 22.4 秒、离线约 25.4 秒，三次 Pi 均正常退出并回收 Context7。状态为 `可申请 R1`；不适合只检查 `isError` 的无人值守消费者，必须同时检查 `details.error` 和错误文本。
 
 ### MCP-04｜Chrome DevTools 与 Playwright 分工
 
@@ -979,10 +981,10 @@ FxTwitter、Web Clipper、yt-dlp、Agent Reach 等只是候选适配器。登录
 
 | ID | 精确候选 | 用途 | 当前证据 | 下一步 | 关联 X |
 |---|---|---|---|---|---|
-| P08 | `pi-mcp-adapter@2.15.0` | 受控 MCP 适配 | S1；假服务 `16/16`；单组件 T1 通过；真实 Context7 主链通过、韧性门失败；卸载需快照补充清理 | 诊断错误语义和失败路径回收；不长期保留 | [#5](https://x.com/shitunote/status/2079077524097597774) |
+| P08 | `pi-mcp-adapter@2.15.0` | 受控 MCP 适配 | S1；假服务 `16/16`；单组件 T1 通过；Node 直启 Context7 条件化韧性链通过；卸载需快照补充清理 | 可申请与 M01 组合 R1；禁用 `cmd /c npx` | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | P09 | `pi-web-access@0.14.0` | 网页、PDF、GitHub、视频采集 | S1 兼容/恢复通过 | 公开来源 T1；Cookie 默认关闭 | [#43](https://x.com/AmberTreelet/status/2067884172648276241) |
 | P10 | `pi-playwright@0.1.1` | 页面流程和浏览器证据 | Extension/Skill 兼容/恢复通过 | 独立 Profile、trusted/untrusted、危险动作授权 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
-| M01 | `@upstash/context7-mcp@3.2.5` | 版本相关官方文档 | 真实指定版本官方文档查询通过；错误版本与离线可识别；错误标志和失败路径回收不合格 | `hold`：先修复或规避韧性问题，再重复完整用途链 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
+| M01 | `@upstash/context7-mcp@3.2.5` | 版本相关官方文档 | 正常查询、错误版本、离线和 Node 直启回收通过；Server 把业务/网络错误作为普通文本返回 | 可申请 R1；固定稳定安装路径，自动化同时检查错误文本 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
 | M02 | `chrome-devtools-mcp@1.6.0` | 调试协议、性能和运行时证据 | Windows CLI/help 通过 | 与 Playwright 分工后再测 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 
 ### 14.4 执行循环控制
@@ -1030,6 +1032,7 @@ P13 自带 Oracle profile 虽提示只读，但工具列表含 `bash`；未经�
 | 本地个人版 Pi 0.83.0 基线复验 | 10/10 | 当前全局命令指向个人版发布；默认 Luna/max；真实请求成功；认证与设置不变；无运行残留 | 交互式 TUI、项目 trust 三态、构建与完整测试套件 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
 | P08 / T1 正式安装—验证—卸载 | 通过；发现并清理卸载残留 | 精确 Package 可安装；Adapter 在 trusted、untrusted 和默认 ask 下按预期加载；Luna/max 不变；可完整回滚 | 真实 MCP Server、工具调用、OAuth、长期保留和组合行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | P08→M01 真实 Context7 用途链 | 功能主链通过；韧性门失败 | Pi 能通过 Adapter 惰性连接 Context7，解析库 ID 并查询指定版本官方文档；错误版本和离线可被模型识别 | 错误结果可被机器可靠识别、失败路径及时退出、长期稳定性和长期保留资格 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
+| P08→M01 韧性诊断与 Node 直启复验 | 条件化通过；可申请 R1 | `cmd /c` 是孙进程残留原因；Node 直启固定版本在正常、错误版本、离线三链均及时回收；错误文本来源边界已定位 | 无人值守消费者只检查 `isError` 仍不安全；尚未批准长期安装 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
 | 历史正式 Pi 0.82.1 max | 12/12 | 当时默认是 Luna/max，认证不变 | 未来版本或当前 0.83.0 仍相同 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
 | Pi 候选影子加载 | 12 完整恢复、4 有持久状态、1 静态 | 固定版本在当前 Windows/Pi 的加载与恢复面 | 业务行为合格 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
 | Pi→MCP 假服务链 | 16/16 | P08 在固定假服务链能加载、调用和退出 | 真实 MCP、认证和远端行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
@@ -1164,15 +1167,45 @@ claim_ceiling: 只证明一次指定版本文档任务的功能价值和两类�
 next_gate: 先用最小可重复诊断区分 Adapter、Windows stdio/npx 和 Context7 的责任边界；修复或形成可靠规避后，重复整条正常查询—错误版本—离线超时—回收—卸载链
 ```
 
+### 15.4 P08→M01 韧性诊断与 Node 直启复验
+
+```text
+candidate_id: P08 + M01
+exact_version: pi-mcp-adapter@2.15.0 + @upstash/context7-mcp@3.2.5
+last_tested: 2026-07-31 Asia/Shanghai
+runtime: 本地个人版 Pi 0.83.0 / Windows NT 10.0.26200.0 / Node v24.17.0 / npm 11.13.0
+goal: 定位 isError=false 与失败路径延迟退出的责任层，并验证不修改 Pi 源码的稳定规避
+feedback_loop: 已保存 JSONL 错误重放器 + 不响应 initialize 的受控 stdio Server + 真实 Context7 纵向 Runner
+ranked_hypotheses: Adapter 错误映射设计 / Context7 普通文本错误合同 / cmd-npx Windows 进程树 / 测试外壳计时器
+source_findings: Adapter 2.15.0 只把 MCP result.isError 或 call_failed 映射成 Pi isError=true；Context7 fetchLibraryContext 捕获 HTTP/fetch 失败后返回 data 文本，query-docs 再把 data 作为普通 content 返回
+process_control_direct: 受控 Server 直接由 Node 启动；连接超时后 Server 已退出，关闭 RPC 输入后 Pi 约 15 毫秒退出
+process_control_cmd: 只改成 cmd /c node；连接超时和 Pi 退出后孙进程仍存活，复现器判红并按精确 PID 清理
+root_cause_process: 原配置使用 cmd /c npx，绕过 Adapter 仅对顶层 npx/npm 生效的直接二进制解析；顶层 cmd 被关闭后不能保证孙进程同时退出
+root_cause_error_signal: 错误版本和离线 fetch 由 Context7 Server 转成普通文本成功结果；Adapter没有 MCP isError 可传播。Adapter 自己的连接/退避状态位于 details.error，按 2.15.0 设计不提升为 Pi isError
+workaround: 固定安装 Context7 3.2.5，并用 Node 直接启动其 dist/index.js；禁止 cmd /c npx。Agent 消费结果时同时检查 details.error 与错误文本，不能只看 isError
+normal_chain: resolve-library-id 与 /vercel/next.js/v15.1.11 query-docs 通过；返回四个 vercel/next.js v15.1.11 官方 GitHub 文档 URL；约 42.6 秒；Pi exit 0；Context7 PID 已退出
+wrong_version_chain: /vercel/next.js/v99.0.0 返回明确 Version not found 和可用版本；模型报告错误且没有回退；约 22.4 秒；Pi exit 0；Context7 PID 已退出
+offline_chain: 127.0.0.1:9 代理下 query-docs 返回 Error fetching library context / TypeError: fetch failed；模型报告失败且没有回退；约 25.4 秒；Pi exit 0；Context7 PID 已退出
+harness_correction: 纵向 Runner 最初未清除 90 秒保护计时器，导致测试外壳延迟；修正后后两条链的外层耗时与 Runner 耗时一致。这不是 Pi 或 Context7 残留
+formal_files_before_after: 正式 settings.json SHA256 39F8601498E5687BFB6690A466E4A7E94510AE672077CB640C9BC87837D8DD3F，未变化
+auth_hash_before_after: 正式 auth.json SHA256 425ABA0EA755B68147DA1B26E36E40EF9369975DA046DB6383BC59BCE8EB43D3，未变化；隔离测试认证副本已删除
+residual_state: 正式第三方 Package 为 0；正式 npm 与 mcp-cache.json 不存在；七个受控/真实测试 PID 最终均不存在
+hard_failures: none under Node-direct configuration
+limitations: Context7 的业务/网络错误仍是 isError=false；只检查布尔错误标志的自动化不合格。每个真实 fixture 只运行 1 次，尚未证明长期重复稳定性
+decision: request_R1
+claim_ceiling: 证明当前 Windows/Pi/固定版本在 Node 直启约束下可完成三类真实用途并及时回收；不批准 cmd/npx 包装、其他 MCP、其他版本或只检查 isError 的无人值守流程
+next_gate: 用户单独批准 R1 后，把 Adapter 与 Context7 固定安装到稳定目录，写入 Node 直启配置，再执行安装后正常/错误/离线/重启/回滚验收
+```
+
 ## 16. 推荐的下一实验顺序
 
-### 已完成：P08 单组件 T1 与 P08→M01 功能主链
+### 已完成：P08 单组件 T1、P08→M01 功能主链与韧性诊断
 
-2026-07-31 已完成 Adapter 单组件安装/信任/卸载验证，以及 Context7 指定版本官方文档真实查询。正式 Pi 已回退为零第三方 Package，没有批准长期保留。
+2026-07-31 已完成 Adapter 单组件安装/信任/卸载验证、Context7 指定版本官方文档真实查询，以及错误语义和 Windows 子进程回收诊断。Node 直启固定 Context7 的正常、错误版本和离线链均完成且无进程残留。正式 Pi 仍为零第三方 Package。
 
-### 第一优先：诊断 P08→M01 韧性失败并复跑用途链
+### 第一优先：申请 P08+M01 / R1
 
-先用最小可重复实验区分 Adapter、Windows stdio/npx 和 Context7 的责任边界，重点处理 `isError=false` 与 `agent_settled` 后延迟退出。诊断只为缩小因果边界；修复或形成可靠规避后，必须重新执行正常查询、错误版本、离线超时、惰性启动、回收和卸载的完整用途链。通过仍不自动批准其他 MCP。
+如果用户需要长期使用 Context7，可另行批准 R1：固定安装 Adapter 2.15.0 和 Context7 3.2.5，保存到稳定目录，并由 Node 直接启动 `dist/index.js`。禁止 `cmd /c npx`；安装后必须重新验收正常查询、错误版本、离线、Pi 重启、进程回收和完整卸载。该批准不扩展到其他 MCP。
 
 ### 第二优先：资源型低风险候选
 
