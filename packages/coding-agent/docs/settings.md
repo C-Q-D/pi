@@ -1,38 +1,38 @@
-# Settings
+# 设置
 
-Pi uses JSON settings files with project settings overriding global settings.
+Pi 使用 JSON 设置文件，项目设置会覆盖全局设置。
 
-| Location | Scope |
+| 位置 | 作用范围 |
 |----------|-------|
-| `~/.pi/agent/settings.json` | Global (all projects) |
-| `.pi/settings.json` | Project (current directory) |
+| `~/.pi/agent/settings.json` | 全局（所有项目） |
+| `.pi/settings.json` | 项目（当前目录） |
 
-Edit directly or use `/settings` for common options.
+可以直接编辑文件，也可以使用 `/settings` 修改常用选项。
 
-## Project Trust
+## 项目信任
 
-On interactive startup, pi asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.pi/agent/trust.json`. Trusting a project allows pi to load `.pi/settings.json` and `.pi` resources, install missing project packages, and execute project extensions.
+交互式启动时，如果项目文件夹包含项目本地设置、资源或项目 `.agents/skills`，并且 `~/.pi/agent/trust.json` 中没有针对该文件夹或其父文件夹的已保存决定，Pi 会先询问是否信任。信任项目后，Pi 可以加载 `.pi/settings.json` 和 `.pi` 资源、安装缺失的项目 Package，并执行项目 Extension。
 
-Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore those project resources, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
+非交互模式（`-p`、`--mode json` 和 `--mode rpc`）不会显示信任提示。如果没有适用的已保存决定，它们会使用全局设置中的 `defaultProjectTrust`：`ask`（默认）和 `never` 会忽略这些项目资源，`always` 则会信任。传入 `--approve`/`-a` 或 `--no-approve`/`-na` 可以只为本次运行覆盖项目信任。
 
-If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.pi/agent/settings.json`, or change it with `/settings`.
+如果没有适用的 Extension 或已保存决定，回退行为由 `defaultProjectTrust` 控制。可以在 `~/.pi/agent/settings.json` 中将其设为 `"ask"`、`"always"` 或 `"never"`，也可以通过 `/settings` 修改。
 
-`pi config` and package commands use the same project trust flow, except `pi update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+`pi config` 和 Package 命令使用相同的项目信任流程，但 `pi update` 永远不会显示提示。传入 `--approve` 可以在单次命令中信任项目本地设置，传入 `--no-approve` 则忽略它们。
 
-Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.pi/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
+在交互模式中使用 `/trust` 保存供以后 Session 使用的项目信任决定，也可以信任直接父文件夹。该命令只写入 `~/.pi/agent/trust.json`，不会重新加载当前 Session，因此需要重启 Pi 才能使更改生效。
 
-## All Settings
+## 所有设置
 
-### Model & Thinking
+### 模型与 Thinking
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
-| `defaultModel` | string | - | Default model ID |
+| `defaultProvider` | string | - | 默认 Provider（例如 `"anthropic"`、`"openai"`） |
+| `defaultModel` | string | - | 默认模型 ID |
 | `defaultThinkingLevel` | string | - | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
-| `showCacheMissNotices` | boolean | `false` | Show transcript notices for significant prompt-cache misses |
-| `thinkingBudgets` | object | - | Custom token budgets per thinking level |
+| `hideThinkingBlock` | boolean | `false` | 在输出中隐藏 Thinking Block |
+| `showCacheMissNotices` | boolean | `false` | Prompt Cache 大量 Miss 时在对话中显示提示 |
+| `thinkingBudgets` | object | - | 为各 Thinking Level 自定义 Token Budget |
 
 #### thinkingBudgets
 
@@ -47,26 +47,26 @@ Use `/trust` in interactive mode to save a project trust decision for future ses
 }
 ```
 
-### UI & Display
+### UI 与显示
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `theme` | string | `"dark"` | Theme name (`"dark"`, `"light"`, or custom) |
-| `externalEditor` | string | `$VISUAL`, then `$EDITOR`, then Notepad on Windows or `nano` elsewhere | Command for Ctrl+G external editor; takes precedence over environment variables |
-| `quietStartup` | boolean | `false` | Hide startup header |
-| `defaultProjectTrust` | string | `"ask"` | Fallback project trust behavior: `"ask"`, `"always"`, or `"never"`. Global setting only |
-| `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
-| `enableInstallTelemetry` | boolean | `true` | Send an anonymous install/update version ping after first install or changelog-detected updates. This does not control update checks |
-| `enableAnalytics` | boolean | `false` | Opt-in analytics data sharing. Currently only asked for during the experimental first-time setup (`PI_EXPERIMENTAL=1`) |
-| `trackingId` | string | - | Analytics tracking identifier, generated when `enableAnalytics` is turned on |
-| `doubleEscapeAction` | string | `"tree"` | Action for double-escape: `"tree"`, `"fork"`, or `"none"` |
-| `treeFilterMode` | string | `"default"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
-| `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
-| `outputPad` | number | `1` | Horizontal padding for user messages, assistant messages, and thinking (0 or 1) |
-| `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
-| `showHardwareCursor` | boolean | `false` | Show the terminal cursor while TUI positions it for IME support |
+| `theme` | string | `"dark"` | Theme 名称（`"dark"`、`"light"` 或自定义值） |
+| `externalEditor` | string | `$VISUAL`，然后 `$EDITOR`，再到 Windows 上的 Notepad 或其他平台的 `nano` | Ctrl+G 使用的外部编辑器命令；优先于环境变量 |
+| `quietStartup` | boolean | `false` | 隐藏启动 Header |
+| `defaultProjectTrust` | string | `"ask"` | 项目信任回退行为：`"ask"`、`"always"` 或 `"never"`；仅限全局设置 |
+| `collapseChangelog` | boolean | `false` | 更新后显示精简 Changelog |
+| `enableInstallTelemetry` | boolean | `true` | 首次安装或检测到 Changelog 更新后，匿名上报安装/更新版本；不控制更新检查 |
+| `enableAnalytics` | boolean | `false` | 选择加入 Analytics 数据分享；目前只在实验性首次设置（`PI_EXPERIMENTAL=1`）中询问 |
+| `trackingId` | string | - | Analytics 跟踪标识符，在启用 `enableAnalytics` 时生成 |
+| `doubleEscapeAction` | string | `"tree"` | 连按两次 Escape 的操作：`"tree"`、`"fork"` 或 `"none"` |
+| `treeFilterMode` | string | `"default"` | `/tree` 的默认 Filter：`"default"`、`"no-tools"`、`"user-only"`、`"labeled-only"`、`"all"` |
+| `editorPaddingX` | number | `0` | 输入编辑器的水平 Padding（0-3） |
+| `outputPad` | number | `1` | 用户消息、Assistant 消息和 Thinking 的水平 Padding（0 或 1） |
+| `autocompleteMaxVisible` | number | `5` | 自动补全下拉列表最大可见项数（3-20） |
+| `showHardwareCursor` | boolean | `false` | TUI 为支持 IME 定位光标时，显示终端硬件光标 |
 
-For VS Code, include `--wait` so pi resumes after the editor exits:
+使用 VS Code 时加入 `--wait`，使 Pi 在编辑器退出后继续：
 
 ```json
 {
@@ -74,17 +74,17 @@ For VS Code, include `--wait` so pi resumes after the editor exits:
 }
 ```
 
-### Telemetry and update checks
+### Telemetry 与更新检查
 
-`enableInstallTelemetry` only controls the anonymous install/update ping to `https://pi.dev/api/report-install`. Opting out of telemetry does not disable update checks; Pi can still fetch `https://pi.dev/api/latest-version` to look for the latest version.
+`enableInstallTelemetry` 只控制发送到 `https://pi.dev/api/report-install` 的匿名安装/更新 Ping。退出 Telemetry 不会禁用更新检查；Pi 仍可请求 `https://pi.dev/api/latest-version` 查询最新版本。
 
-Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--offline` or `PI_OFFLINE=1` to disable all startup network operations described here, including update checks, package update checks, and install/update telemetry.
+设置 `PI_SKIP_VERSION_CHECK=1` 可禁用 Pi 版本更新检查。使用 `--offline` 或 `PI_OFFLINE=1` 可以禁用这里描述的所有启动网络操作，包括版本更新检查、Package 更新检查和安装/更新 Telemetry。
 
-### Network
+### 网络
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `httpProxy` | string | - | HTTP proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY`. Global setting only. |
+| `httpProxy` | string | - | 同时应用为 `HTTP_PROXY` 和 `HTTPS_PROXY` 的 HTTP Proxy URL；仅限全局设置 |
 
 ```json
 {
@@ -92,11 +92,11 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 }
 ```
 
-### Warnings
+### 警告
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `warnings.anthropicExtraUsage` | boolean | `true` | Show a warning when Anthropic subscription auth may use paid extra usage |
+| `warnings.anthropicExtraUsage` | boolean | `true` | Anthropic 订阅认证可能产生额外付费用量时显示警告 |
 
 ```json
 {
@@ -106,13 +106,13 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 }
 ```
 
-### Compaction
+### 上下文压缩
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `compaction.enabled` | boolean | `true` | Enable auto-compaction |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.enabled` | boolean | `true` | 启用自动压缩 |
+| `compaction.reserveTokens` | number | `16384` | 为 LLM 响应预留的 Token |
+| `compaction.keepRecentTokens` | number | `20000` | 保留且不进行摘要的近期 Token |
 
 ```json
 {
@@ -124,27 +124,27 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 }
 ```
 
-### Branch Summary
+### 分支摘要
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `branchSummary.reserveTokens` | number | `16384` | Tokens reserved for branch summarization |
-| `branchSummary.skipPrompt` | boolean | `false` | Skip "Summarize branch?" prompt on `/tree` navigation (defaults to no summary) |
+| `branchSummary.reserveTokens` | number | `16384` | 为分支摘要预留的 Token |
+| `branchSummary.skipPrompt` | boolean | `false` | `/tree` 导航时跳过“是否总结分支？”提示（默认不生成摘要） |
 
 ### Retry
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `retry.enabled` | boolean | `true` | Enable automatic agent-level retry on transient errors |
-| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
-| `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
-| `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
-| `retry.provider.maxRetries` | number | `0` | Provider/SDK retry attempts |
-| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
+| `retry.enabled` | boolean | `true` | 发生暂时性错误时启用 Agent 级自动重试 |
+| `retry.maxRetries` | number | `3` | Agent 级最大重试次数 |
+| `retry.baseDelayMs` | number | `2000` | Agent 级指数退避基础延迟（2s、4s、8s） |
+| `retry.provider.timeoutMs` | number | SDK 默认值 | Provider/SDK 请求超时，单位为毫秒 |
+| `retry.provider.maxRetries` | number | `0` | Provider/SDK 重试次数 |
+| `retry.provider.maxRetryDelayMs` | number | `60000` | 服务器要求的最大可接受延迟（60s），超过后立即失败 |
 
-When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs`, the request fails immediately with an informative error instead of waiting silently. Set it to `0` to disable the limit.
+当 Provider 要求的重试延迟超过 `retry.provider.maxRetryDelayMs` 时，请求会立即失败并返回说明性错误，而不是静默等待。设为 `0` 可禁用该限制。
 
-Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explicitly needed. Setting it above `0` can make SDK/provider retries handle out-of-usage-limit errors before Pi sees them, which may block the agent until the provider quota resets in some circumstances.
+除非明确需要 Provider 级重试，否则请将 `retry.provider.maxRetries` 保持为 `0`。将其设为大于 `0` 可能导致 SDK/Provider 在 Pi 看到用量超限错误前自行重试；某些情况下，这会阻塞 Agent，直到 Provider Quota 重置。
 
 ```json
 {
@@ -161,33 +161,33 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 }
 ```
 
-### Message Delivery
+### 消息投递
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `steeringMode` | string | `"one-at-a-time"` | How steering messages are sent: `"all"` or `"one-at-a-time"` |
-| `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
-| `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"` |
-| `httpIdleTimeoutMs` | number | `300000` | HTTP header/body idle timeout in milliseconds, also used by providers with explicit stream idle timeouts. Set to `0` to disable. |
-| `websocketConnectTimeoutMs` | number | `15000` | WebSocket connect/open handshake timeout in milliseconds for providers that support WebSocket transports. Set to `0` to disable. |
+| `steeringMode` | string | `"one-at-a-time"` | Steering 消息发送方式：`"all"` 或 `"one-at-a-time"` |
+| `followUpMode` | string | `"one-at-a-time"` | Follow-up 消息发送方式：`"all"` 或 `"one-at-a-time"` |
+| `transport` | string | `"auto"` | 对支持多种 Transport 的 Provider，优先使用：`"sse"`、`"websocket"`、`"websocket-cached"` 或 `"auto"` |
+| `httpIdleTimeoutMs` | number | `300000` | HTTP Header/Body 空闲超时，单位为毫秒；也用于具有显式 Stream 空闲超时的 Provider。设为 `0` 可禁用 |
+| `websocketConnectTimeoutMs` | number | `15000` | 支持 WebSocket Transport 的 Provider 建立连接/打开握手的超时，单位为毫秒。设为 `0` 可禁用 |
 
-### Terminal & Images
+### 终端与图片
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `terminal.showImages` | boolean | `true` | Show images in terminal (if supported) |
-| `terminal.imageWidthCells` | number | `60` | Preferred inline image width in terminal cells |
-| `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
-| `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
-| `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
+| `terminal.showImages` | boolean | `true` | 如果终端支持，则显示图片 |
+| `terminal.imageWidthCells` | number | `60` | Inline 图片宽度，单位为终端 Cell |
+| `terminal.clearOnShrink` | boolean | `false` | 内容缩小时清除空行（可能导致闪烁） |
+| `images.autoResize` | boolean | `true` | 将图片尺寸调整到最大 2000x2000 |
+| `images.blockImages` | boolean | `false` | 阻止向 LLM 发送任何图片 |
 
 ### Shell
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `shellPath` | string | - | Custom shell path (e.g., for Cygwin on Windows); supports a leading `~` for the home directory |
-| `shellCommandPrefix` | string | - | Prefix for every bash command (e.g., `"shopt -s expand_aliases"`) |
-| `npmCommand` | string[] | - | Command argv used for npm package lookup/install operations (e.g., `["mise", "exec", "node@20", "--", "npm"]`) |
+| `shellPath` | string | - | 自定义 Shell 路径（例如 Windows 上的 Cygwin）；支持用开头的 `~` 表示 Home 目录 |
+| `shellCommandPrefix` | string | - | 每条 Bash 命令使用的前缀（例如 `"shopt -s expand_aliases"`） |
+| `npmCommand` | string[] | - | npm Package 查询/安装操作所用的命令 argv（例如 `["mise", "exec", "node@20", "--", "npm"]`） |
 
 ```json
 {
@@ -195,25 +195,25 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 }
 ```
 
-`npmCommand` is used for all npm package-manager operations, including installs, uninstalls, and dependency installs inside git packages. User-scoped npm packages install under `~/.pi/agent/npm/`; project-scoped npm packages install under `.pi/npm/`. Use argv-style entries exactly as the process should be launched. When `npmCommand` is configured, git package dependency installs use plain `install` to avoid npm-specific flags in wrappers or alternate package managers.
+`npmCommand` 用于所有 npm Package Manager 操作，包括安装、卸载，以及 Git Package 内部的依赖安装。用户范围的 npm Package 安装到 `~/.pi/agent/npm/`；项目范围的 npm Package 安装到 `.pi/npm/`。请按照进程实际启动方式填写 argv 风格条目。配置 `npmCommand` 后，Git Package 依赖安装会使用普通 `install`，避免向 Wrapper 或其他 Package Manager 传入 npm 特有 Flag。
 
-### Sessions
+### Session
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
+| `sessionDir` | string | - | Session 文件存储目录；支持绝对路径、相对路径和 `~` |
 
 ```json
 { "sessionDir": ".pi/sessions" }
 ```
 
-When multiple sources specify a session directory, precedence is `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, then `sessionDir` in settings.json.
+多个来源同时指定 Session 目录时，优先级依次为 `--session-dir`、`PI_CODING_AGENT_SESSION_DIR`、settings.json 中的 `sessionDir`。
 
-### Model Cycling
+### 模型循环切换
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `enabledModels` | string[] | - | Model patterns for Ctrl+P cycling (same format as `--models` CLI flag) |
+| `enabledModels` | string[] | - | Ctrl+P 循环切换使用的模型 Pattern（格式与 `--models` CLI Flag 相同） |
 
 ```json
 {
@@ -223,30 +223,30 @@ When multiple sources specify a session directory, precedence is `--session-dir`
 
 ### Markdown
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `markdown.codeBlockIndent` | string | `"  "` | Indentation for code blocks |
+| `markdown.codeBlockIndent` | string | `"  "` | Code Block 缩进 |
 
-### Resources
+### 资源
 
-These settings define where to load extensions, skills, prompts, and themes from.
+以下设置定义从何处加载 Extension、Skill、Prompt 和 Theme。
 
-Paths in `~/.pi/agent/settings.json` resolve relative to `~/.pi/agent`. Paths in `.pi/settings.json` resolve relative to `.pi`. Absolute paths and `~` are supported.
+`~/.pi/agent/settings.json` 中的路径相对于 `~/.pi/agent` 解析；`.pi/settings.json` 中的路径相对于 `.pi` 解析。支持绝对路径和 `~`。
 
-| Setting | Type | Default | Description |
+| 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
-| `packages` | array | `[]` | npm/git packages to load resources from |
-| `extensions` | string[] | `[]` | Local extension file paths or directories |
-| `skills` | string[] | `[]` | Local skill file paths or directories |
-| `prompts` | string[] | `[]` | Local prompt template paths or directories |
-| `themes` | string[] | `[]` | Local theme file paths or directories |
-| `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
+| `packages` | array | `[]` | 要从中加载资源的 npm/Git Package |
+| `extensions` | string[] | `[]` | 本地 Extension 文件路径或目录 |
+| `skills` | string[] | `[]` | 本地 Skill 文件路径或目录 |
+| `prompts` | string[] | `[]` | 本地 Prompt Template 文件路径或目录 |
+| `themes` | string[] | `[]` | 本地 Theme 文件路径或目录 |
+| `enableSkillCommands` | boolean | `true` | 将 Skill 注册为 `/skill:name` 命令 |
 
-Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
+数组支持 Glob Pattern 和排除项。使用 `!pattern` 排除；使用 `+path` 强制包含精确路径，使用 `-path` 强制排除精确路径。
 
 #### packages
 
-String form loads all resources from a package:
+字符串形式会加载 Package 中的所有资源：
 
 ```json
 {
@@ -254,7 +254,7 @@ String form loads all resources from a package:
 }
 ```
 
-Object form filters which resources to load:
+对象形式可以筛选要加载的资源：
 
 ```json
 {
@@ -268,9 +268,9 @@ Object form filters which resources to load:
 }
 ```
 
-See [packages.md](packages.md) for package management details.
+Package 管理详情参阅 [packages.md](packages.md)。
 
-## Example
+## 示例
 
 ```json
 {
@@ -295,23 +295,23 @@ See [packages.md](packages.md) for package management details.
 }
 ```
 
-## Project Overrides
+## 项目覆盖
 
-Project settings (`.pi/settings.json`) override global settings. Nested objects are merged:
+项目设置（`.pi/settings.json`）会覆盖全局设置。嵌套对象会被合并：
 
 ```json
-// ~/.pi/agent/settings.json (global)
+// ~/.pi/agent/settings.json（全局）
 {
   "theme": "dark",
   "compaction": { "enabled": true, "reserveTokens": 16384 }
 }
 
-// .pi/settings.json (project)
+// .pi/settings.json（项目）
 {
   "compaction": { "reserveTokens": 8192 }
 }
 
-// Result
+// 结果
 {
   "theme": "dark",
   "compaction": { "enabled": true, "reserveTokens": 8192 }

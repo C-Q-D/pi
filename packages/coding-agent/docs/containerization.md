@@ -1,27 +1,28 @@
-# Containerization
+# 容器化
 
-Pi runs with all permissions by default, but in some cases, you will want to have more control over what directories Pi can write to and which accesses it has.
+Pi 默认以完整权限运行，但在某些场景下，你可能希望更严格地控制 Pi 可以写入哪些目录，以及它能够访问哪些资源。
 
-There are two general options. You can either
-1. run the whole `pi` process inside an isolated environment, or
-2. run `pi` on the host and route tool execution into an isolated environment.
+通常有两种方案：
 
-## Choose a pattern
+1. 在隔离环境中运行整个 `pi` 进程；或者
+2. 在宿主机上运行 `pi`，并把工具执行路由到隔离环境。
 
-| Pattern | What is isolated | Best for | Notes |
+## 选择隔离模式
+
+| 模式 | 隔离内容 | 适用场景 | 说明 |
 | --- | --- | --- | --- |
-| Gondolin extension | Built-in tools and `!` commands | Local micro-VM isolation while keeping auth on host | See [`examples/extensions/gondolin/`](../examples/extensions/gondolin/). |
-| Plain Docker | Whole `pi` process in a local container | Simple local isolation | Provider API keys enter the container. |
-| OpenShell | Whole `pi` process in a policy-controlled sandbox | Local or remote managed sandbox | Requires an OpenShell gateway |
+| Gondolin Extension | 内置工具和 `!` 命令 | 将认证保留在宿主机，同时使用本地 micro-VM 隔离 | 参阅 [`examples/extensions/gondolin/`](../examples/extensions/gondolin/)。 |
+| 普通 Docker | 本地 Container 中的整个 `pi` 进程 | 简单的本地隔离 | Provider API key 会进入 Container。 |
+| OpenShell | 受策略控制的 Sandbox 中的整个 `pi` 进程 | 本地或远程托管 Sandbox | 需要 OpenShell Gateway |
 
-Extensions run wherever the `pi` process runs. If you run host `pi` with a tool-routing extension, other custom extension tools still run on the host unless they also delegate their operations.
+Extension 会在 `pi` 进程所在的位置运行。如果在宿主机上运行 `pi` 并使用工具路由 Extension，其他自定义 Extension 工具仍会在宿主机运行，除非它们也把操作委派到隔离环境。
 
 ## Gondolin
 
-[Gondolin](https://github.com/earendil-works/gondolin) is a local Linux micro-VM.
-Use the [example extension](../examples/extensions/gondolin) when you want `pi` on the host but all built-in tools routed into the VM.
+[Gondolin](https://github.com/earendil-works/gondolin) 是本地 Linux micro-VM。
+如果希望在宿主机上运行 `pi`，同时把所有内置工具路由到 VM，请使用[示例 Extension](../examples/extensions/gondolin)。
 
-Setup:
+设置：
 
 ```bash
 cp -R packages/coding-agent/examples/extensions/gondolin ~/.pi/agent/extensions/gondolin
@@ -29,22 +30,22 @@ cd ~/.pi/agent/extensions/gondolin
 npm install --ignore-scripts
 ```
 
-Run from the project you want mounted:
+在需要挂载的项目中运行：
 
 ```bash
 cd /path/to/project
 pi -e ~/.pi/agent/extensions/gondolin
 ```
 
-The extension mounts the host cwd at `/workspace` in the VM and overrides `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
-User `!` commands are routed into the VM, as well.
-File changes under `/workspace` write through to the host.
+该 Extension 把宿主机当前工作目录挂载到 VM 的 `/workspace`，并覆盖 `read`、`write`、`edit`、`bash`、`grep`、`find` 和 `ls`。
+用户执行的 `!` 命令也会被路由到 VM。
+对 `/workspace` 下文件的修改会同步写入宿主机。
 
-Requirements: Node.js >= 23.6.0 for `@earendil-works/gondolin`, plus QEMU (requires installation through your package manager).
+要求：`@earendil-works/gondolin` 需要 Node.js >= 23.6.0，此外还需要通过 Package Manager 安装 QEMU。
 
-## Plain Docker
+## 普通 Docker
 
-Run the whole `pi` process in Docker when you want the simplest local container boundary.
+如果需要最简单的本地 Container 边界，可以在 Docker 中运行整个 `pi` 进程。
 
 `Dockerfile.pi`:
 
@@ -60,7 +61,7 @@ WORKDIR /workspace
 ENTRYPOINT ["pi"]
 ```
 
-Build and run:
+构建并运行：
 
 ```bash
 docker build -t pi-sandbox -f Dockerfile.pi .
@@ -72,40 +73,40 @@ docker run --rm -it \
   pi-sandbox
 ```
 
-The `-v "$PWD:/workspace"` mounts your current directory into the container at /workspace such that reads and writes in `/workspace` inside Docker directly affect your host files, like in the Gondolin example.
+`-v "$PWD:/workspace"` 会把当前目录挂载到 Container 的 `/workspace`。因此，与 Gondolin 示例一样，Docker 内对 `/workspace` 的读写会直接影响宿主机文件。
 
-Use a named volume for `/root/.pi/agent` if you want container-local settings and sessions. Mounting your host `~/.pi/agent` exposes host auth and session files to the container.
+如果希望设置和 Session 只存在于 Container 中，请为 `/root/.pi/agent` 使用 Named Volume。挂载宿主机的 `~/.pi/agent` 会把宿主机认证和 Session 文件暴露给 Container。
 
 ## OpenShell
 
-Use [NVIDIA OpenShell](https://docs.nvidia.com/openshell/about/overview) when you want a policy-controlled sandbox with filesystem, process, network, credential, and inference controls.
-OpenShell can run sandboxes through a local gateway backed by Docker, Podman, or a VM runtime, or through a remote Kubernetes gateway.
+如果需要能够控制文件系统、进程、网络、凭据和推理的策略化 Sandbox，请使用 [NVIDIA OpenShell](https://docs.nvidia.com/openshell/about/overview)。
+OpenShell 可以通过由 Docker、Podman 或 VM Runtime 支持的本地 Gateway 运行 Sandbox，也可以使用远程 Kubernetes Gateway。
 
-Every sandbox requires an active gateway.
-Register and select one before creating a sandbox:
+每个 Sandbox 都需要一个活动 Gateway。
+创建 Sandbox 前，先注册并选择 Gateway：
 
 ```bash
 openshell gateway add <gateway-url> --name <name>
 openshell gateway select <name>
 ```
 
-Launch `pi` inside an OpenShell sandbox:
+在 OpenShell Sandbox 中启动 `pi`：
 
 ```bash
 openshell sandbox create --name pi-sandbox --from pi -- pi
 ```
 
-In this pattern, the whole `pi` process runs inside the sandbox.
-Built-in tools, `!` commands, and extension tools execute inside the OpenShell boundary.
+在这种模式下，整个 `pi` 进程都运行在 Sandbox 内。
+内置工具、`!` 命令和 Extension 工具都在 OpenShell 边界内执行。
 
-If the gateway is remote, project files are not bind-mounted from the host, meaning writes in the sandbox are not reflected on your machine.
-Clone the repository inside the sandbox or use OpenShell file transfer commands:
+如果 Gateway 位于远程，项目文件不会从宿主机 bind mount，因此 Sandbox 中的写入不会反映到本机。
+请在 Sandbox 内克隆仓库，或使用 OpenShell 文件传输命令：
 
 ```bash
 openshell sandbox upload pi-sandbox ./repo /workspace
 openshell sandbox download pi-sandbox /workspace/repo ./repo-out
 ```
 
-OpenShell providers can keep raw model API keys outside the sandbox.
-When inference routing is configured, code inside the sandbox can call `https://inference.local`, and the gateway injects the configured provider credentials upstream.
-Configure Pi to use the corresponding OpenAI-compatible or Anthropic-compatible endpoint if you want model traffic to use this route.
+OpenShell Provider 可以把原始模型 API key 保留在 Sandbox 外。
+配置 Inference Routing 后，Sandbox 内的代码可以调用 `https://inference.local`，Gateway 会向上游注入已配置的 Provider 凭据。
+如果希望模型流量使用该路由，请将 Pi 配置为使用相应的 OpenAI-compatible 或 Anthropic-compatible Endpoint。

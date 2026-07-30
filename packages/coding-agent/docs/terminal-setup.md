@@ -1,40 +1,40 @@
-# Terminal Setup
+# 终端设置
 
-Pi uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
+Pi 使用 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) 来可靠检测修饰键。大多数现代终端都支持该协议，但部分终端需要额外配置。
 
 ## Kitty, iTerm2
 
-Work out of the box.
+无需配置即可使用。
 
-## Apple Terminal
+## Apple 终端
 
-Pi enables enhanced key reporting when available. If Terminal.app still sends plain Return for `Shift+Enter`, pi uses a local macOS modifier fallback to treat that Return as `Shift+Enter`.
+Pi 会在可用时启用增强按键报告。如果 Terminal.app 仍然把 `Shift+Enter` 作为普通 Return 发送，Pi 会使用本地 macOS 修饰键回退机制，将该 Return 视为 `Shift+Enter`。
 
-This fallback only works when pi runs on the same Mac as Terminal.app. It cannot detect the local keyboard over remote SSH.
+该回退机制仅在 Pi 与 Terminal.app 运行于同一台 Mac 时有效，无法通过远程 SSH 检测本地键盘。
 
 ## Ghostty
 
-Add to your Ghostty config (`~/Library/Application Support/com.mitchellh.ghostty/config` on macOS, `~/.config/ghostty/config` on Linux):
+在 Ghostty 配置中添加以下内容（macOS：`~/Library/Application Support/com.mitchellh.ghostty/config`；Linux：`~/.config/ghostty/config`）：
 
 ```
 keybind = alt+backspace=text:\x1b\x7f
 ```
 
-Older Claude Code versions may have added this Ghostty mapping:
+较早版本的 Claude Code 可能添加过以下 Ghostty 映射：
 
 ```
 keybind = shift+enter=text:\n
 ```
 
-That mapping sends a raw linefeed byte. Inside pi, that is indistinguishable from `Ctrl+J`, so tmux and pi no longer see a real `shift+enter` key event.
+该映射发送原始换行字节。在 Pi 内部，这与 `Ctrl+J` 无法区分，因此 tmux 和 Pi 都无法再接收到真正的 `shift+enter` 按键事件。
 
-If Claude Code 2.x or newer is the only reason you added that mapping, you can remove it, unless you want to use Claude Code in tmux, where it still requires that Ghostty mapping.
+如果只是为了 Claude Code 2.x 或更高版本而添加该映射，可以将其删除；但如果需要在 tmux 中使用 Claude Code，则仍然需要保留该 Ghostty 映射。
 
-Pi binds `Ctrl+J` as a default newline alias, so `Shift+Enter` keeps working in tmux via that remap without extra pi configuration.
+Pi 默认把 `Ctrl+J` 绑定为换行 Alias，因此通过该重映射，`Shift+Enter` 在 tmux 中仍可正常使用，无需额外配置 Pi。
 
 ## WezTerm
 
-WezTerm usually works out of the box for `Shift+Enter` via xterm modifyOtherKeys. To use the Kitty keyboard protocol explicitly, create `~/.wezterm.lua`:
+WezTerm 通常可以通过 xterm modifyOtherKeys 直接支持 `Shift+Enter`。如需显式使用 Kitty keyboard protocol，请创建 `~/.wezterm.lua`：
 
 ```lua
 local wezterm = require 'wezterm'
@@ -43,7 +43,7 @@ config.enable_kitty_keyboard = true
 return config
 ```
 
-On macOS, WezTerm binds `Option+Enter` to fullscreen by default. To use `Option+Enter` for pi follow-up queueing, add this key override:
+在 macOS 上，WezTerm 默认将 `Option+Enter` 绑定为全屏。若要使用 `Option+Enter` 将消息加入 Pi Follow-up Queue，请添加以下按键覆盖：
 
 ```lua
 local wezterm = require 'wezterm'
@@ -58,13 +58,13 @@ config.keys = {
 return config
 ```
 
-If you already have a `config.keys` table, add the entry to it.
+如果已有 `config.keys` 表，请将该条目加入其中。
 
-On WSL, WezTerm may require a visible hardware cursor for IME candidate window positioning. If CJK IME candidates do not follow the text cursor, set `PI_HARDWARE_CURSOR=1` before running pi or set `showHardwareCursor` to `true` in settings.
+在 WSL 上，WezTerm 可能需要可见的硬件光标才能定位 IME 候选窗口。如果中文等 CJK IME 候选项没有跟随文本光标，请在运行 Pi 前设置 `PI_HARDWARE_CURSOR=1`，或在设置中将 `showHardwareCursor` 设为 `true`。
 
 ## Alacritty
 
-Alacritty usually works out of the box for `Shift+Enter`. On macOS, `Option+Enter` may arrive as plain `Enter`. To use `Option+Enter` for pi follow-up queueing, add to `~/.config/alacritty/alacritty.toml`:
+Alacritty 通常无需配置即可支持 `Shift+Enter`。在 macOS 上，`Option+Enter` 可能会被作为普通 `Enter` 发送。若要使用 `Option+Enter` 将消息加入 Pi Follow-up Queue，请在 `~/.config/alacritty/alacritty.toml` 中添加：
 
 ```toml
 [[keyboard.bindings]]
@@ -73,20 +73,21 @@ mods = "Alt"
 chars = "\u001b[13;3u"
 ```
 
-Restart Alacritty after changing the config.
+修改配置后重启 Alacritty。
 
-## VS Code (Integrated Terminal)
+## VS Code（集成终端）
 
-VS Code 1.109.5 and newer enable Kitty keyboard protocol in the integrated terminal by default, so `Shift+Enter` should work out of the box.
+VS Code 1.109.5 及更高版本默认在集成终端中启用 Kitty keyboard protocol，因此 `Shift+Enter` 应当无需配置即可使用。
 
-VS Code versions older than 1.109.5 need an explicit terminal keybinding for `Shift+Enter`.
+低于 1.109.5 的 VS Code 版本需要为 `Shift+Enter` 显式配置终端 Keybinding。
 
-`keybindings.json` locations:
+`keybindings.json` 的位置：
+
 - macOS: `~/Library/Application Support/Code/User/keybindings.json`
 - Linux: `~/.config/Code/User/keybindings.json`
 - Windows: `%APPDATA%\\Code\\User\\keybindings.json`
 
-Add to `keybindings.json`:
+在 `keybindings.json` 中添加：
 
 ```json
 {
@@ -99,7 +100,7 @@ Add to `keybindings.json`:
 
 ## Windows Terminal
 
-Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward the modified Enter keys pi uses:
+在 `settings.json` 中添加以下内容（按 Ctrl+Shift+,，或依次选择 Settings → Open JSON file），以转发 Pi 使用的带修饰键 Enter：
 
 ```json
 {
@@ -116,27 +117,28 @@ Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward 
 }
 ```
 
-- `Shift+Enter` inserts a new line.
-- Windows Terminal binds `Alt+Enter` to fullscreen by default. That prevents pi from receiving `Alt+Enter` for follow-up queueing.
-- Remapping `Alt+Enter` to `sendInput` forwards the real key chord to pi instead.
+- `Shift+Enter` 插入新行。
+- Windows Terminal 默认将 `Alt+Enter` 绑定为全屏，这会阻止 Pi 接收用于 Follow-up Queue 的 `Alt+Enter`。
+- 将 `Alt+Enter` 重映射到 `sendInput` 后，会把真实的组合键转发给 Pi。
 
-If you already have an `actions` array, add the objects to it. If the old fullscreen behavior persists, fully close and reopen Windows Terminal.
+如果已有 `actions` 数组，请将这些对象加入其中。如果旧的全屏行为仍然存在，请完全关闭并重新打开 Windows Terminal。
 
 ## xfce4-terminal, terminator
 
-These terminals have limited escape sequence support. Modified Enter keys like `Ctrl+Enter` and `Shift+Enter` cannot be distinguished from plain `Enter`, preventing custom keybindings such as `submit: ["ctrl+enter"]` from working.
+这些终端对 Escape Sequence 的支持有限，无法区分 `Ctrl+Enter`、`Shift+Enter` 等带修饰键的 Enter 和普通 `Enter`，因此 `submit: ["ctrl+enter"]` 等自定义 Keybinding 无法工作。
 
-For the best experience, use a terminal that supports the Kitty keyboard protocol:
+为获得最佳体验，请使用支持 Kitty keyboard protocol 的终端：
+
 - [Kitty](https://sw.kovidgoyal.net/kitty/)
 - [Ghostty](https://ghostty.org/)
 - [WezTerm](https://wezfurlong.org/wezterm/)
 - [iTerm2](https://iterm2.com/)
-- [Alacritty](https://github.com/alacritty/alacritty) (requires compilation with Kitty protocol support)
+- [Alacritty](https://github.com/alacritty/alacritty)（编译时需要启用 Kitty protocol 支持）
 
-## IntelliJ IDEA (Integrated Terminal)
+## IntelliJ IDEA（集成终端）
 
-The built-in terminal has limited escape sequence support. Shift+Enter cannot be distinguished from Enter in IntelliJ's terminal.
+内置终端对 Escape Sequence 的支持有限。在 IntelliJ 终端中，无法区分 Shift+Enter 和 Enter。
 
-If you want the hardware cursor visible, set `PI_HARDWARE_CURSOR=1` before running pi (disabled by default for compatibility).
+如需显示硬件光标，请在运行 Pi 前设置 `PI_HARDWARE_CURSOR=1`（为保持兼容性，默认禁用）。
 
-Consider using a dedicated terminal emulator for the best experience.
+建议使用独立的 Terminal Emulator，以获得最佳体验。
