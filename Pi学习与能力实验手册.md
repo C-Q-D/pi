@@ -832,8 +832,10 @@ typed → dispatched → transport_acknowledged
 - 精确版本 S1 加载/恢复通过；
 - Pi → Adapter → 假 MCP → tool → shutdown 完整链 `16/16`；
 - 测试中 host discovery、direct tools、sampling、elicitation、autoAuth 均关闭。
+- 2026-07-31 在本地个人版 Pi 0.83.0 上完成正式 T1：精确安装、三种 trust 路径、运行态和卸载均通过；
+- `pi remove` 不会物理恢复安装前状态：会留下空 `packages` 数组及 `~/.pi/agent/npm` 管理目录，必须依靠快照恢复和残留隔离。
 
-状态：下一项最适合申请 `T1`。T1 只允许正式单项安装—验证—卸载，不配置真实 MCP，不代表长期保留。
+状态：P08/T1 已通过，但未获长期保留资格。下一步可以单独申请 M01/T1；届时只为该实验临时恢复 Adapter，并继续执行完整快照回滚。
 
 ### MCP-03｜Context7
 
@@ -976,10 +978,10 @@ FxTwitter、Web Clipper、yt-dlp、Agent Reach 等只是候选适配器。登录
 
 | ID | 精确候选 | 用途 | 当前证据 | 下一步 | 关联 X |
 |---|---|---|---|---|---|
-| P08 | `pi-mcp-adapter@2.15.0` | 受控 MCP 适配 | S1；假服务全链 `16/16` | **推荐下一项 T1**：正式单项安装—验证—卸载，不配真实 MCP | [#5](https://x.com/shitunote/status/2079077524097597774) |
+| P08 | `pi-mcp-adapter@2.15.0` | 受控 MCP 适配 | S1；假服务 `16/16`；正式 T1 通过；卸载需快照补充清理 | M01/T1 时临时恢复；不长期保留 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | P09 | `pi-web-access@0.14.0` | 网页、PDF、GitHub、视频采集 | S1 兼容/恢复通过 | 公开来源 T1；Cookie 默认关闭 | [#43](https://x.com/AmberTreelet/status/2067884172648276241) |
 | P10 | `pi-playwright@0.1.1` | 页面流程和浏览器证据 | Extension/Skill 兼容/恢复通过 | 独立 Profile、trusted/untrusted、危险动作授权 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
-| M01 | `@upstash/context7-mcp@3.2.5` | 版本相关官方文档 | stdio initialize/tools-list 通过 | P08 T1 后另行申请真实查询 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
+| M01 | `@upstash/context7-mcp@3.2.5` | 版本相关官方文档 | stdio initialize/tools-list 通过；P08 T1 已通过 | **推荐下一项 T1**：另行申请真实查询 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
 | M02 | `chrome-devtools-mcp@1.6.0` | 调试协议、性能和运行时证据 | Windows CLI/help 通过 | 与 Playwright 分工后再测 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 
 ### 14.4 执行循环控制
@@ -1025,6 +1027,7 @@ P13 自带 Oracle profile 虽提示只读，但工具列表含 `bash`；未经�
 | 实验 | 结果 | 可以证明 | 不能证明 | 相关 X |
 |---|---|---|---|---|
 | 本地个人版 Pi 0.83.0 基线复验 | 10/10 | 当前全局命令指向个人版发布；默认 Luna/max；真实请求成功；认证与设置不变；无运行残留 | 交互式 TUI、项目 trust 三态、构建与完整测试套件 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
+| P08 / T1 正式安装—验证—卸载 | 通过；发现并清理卸载残留 | 精确 Package 可安装；Adapter 在 trusted、untrusted 和默认 ask 下按预期加载；Luna/max 不变；可完整回滚 | 真实 MCP Server、工具调用、OAuth、长期保留和组合行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | 历史正式 Pi 0.82.1 max | 12/12 | 当时默认是 Luna/max，认证不变 | 未来版本或当前 0.83.0 仍相同 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
 | Pi 候选影子加载 | 12 完整恢复、4 有持久状态、1 静态 | 固定版本在当前 Windows/Pi 的加载与恢复面 | 业务行为合格 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
 | Pi→MCP 假服务链 | 16/16 | P08 在固定假服务链能加载、调用和退出 | 真实 MCP、认证和远端行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
@@ -1075,28 +1078,66 @@ side_effects: OpenAI 请求成本 0.000525；无正式文件写入
 rollback: not_required
 decision: continue_testing
 claim_ceiling: 只证明当前 Windows、本地发布、默认模型和非交互最小链路；不证明交互式 TUI、项目 trust 三态、构建或完整测试套件
-next_gate: 申请并执行 P08 / T1 单项安装—验证—卸载
+next_gate: P08 / T1 已于 2026-07-31 完成
+```
+
+### 15.2 P08 / T1 正式安装—验证—卸载记录
+
+```text
+candidate_id: P08
+exact_version: pi-mcp-adapter@2.15.0
+source: https://registry.npmjs.org/pi-mcp-adapter/-/pi-mcp-adapter-2.15.0.tgz
+last_tested: 2026-07-31 Asia/Shanghai
+runtime: 本地个人版 Pi 0.83.0 / Windows NT 10.0.26200.0 / Node v24.17.0 / npm 11.13.0
+goal: 验证正式 Pi 对单一 MCP Adapter 的精确安装、资源发现、trust 行为、运行态和完整回滚
+baseline: BASELINE-0.83.0；正式第三方 Package 为 0
+hypothesis: Adapter 可在不配置真实 MCP 的前提下加载和退出，且卸载后正式状态可恢复
+provider: openai-codex
+model: gpt-5.6-luna
+thinking: max
+formal_or_shadow: T1 formal install-validate-remove canary
+trust_state: --no-approve / --approve / 非交互默认 ask
+enabled_resources: 用户级 pi-mcp-adapter Extension；注册 /mcp 与 /mcp-auth；未配置 MCP Server
+allowed_tools: none
+network: 仅 npm registry 安装；下载正常，未配置代理
+credentials: 未提供 MCP 凭据；OpenAI Codex auth.json 只比较 SHA256
+write_paths: ~/.pi/agent/settings.json 与 ~/.pi/agent/npm
+fixtures: pi install / pi list / npm ls / RPC get_commands / RPC get_state / pi remove / before-after residual audit
+repetitions: 1
+order: Git checkpoint → 正式状态快照 → 安装 → 精确版本与资源检查 → trust 三态 → 运行态 → 卸载 → 残留审计与恢复
+expected_outcome: 精确版本加载；项目 trust 边界正确；无 Server、进程、端口或认证变化；卸载后恢复基线
+observed_output: 安装 118 个依赖且 0 vulnerability；/mcp 与 /mcp-auth 来源均为 npm:pi-mcp-adapter@2.15.0
+time: 安装约 13 秒；卸载约 3.4 秒
+formal_files_before_after: settings.json SHA256 39F8601498E5687BFB6690A466E4A7E94510AE672077CB640C9BC87837D8DD3F，快照恢复后前后一致
+auth_hash_before_after: 425ABA0EA755B68147DA1B26E36E40EF9369975DA046DB6383BC59BCE8EB43D3，前后一致
+residual_state: pi remove 留下 packages: [] 与 ~/.pi/agent/npm；settings 已由快照恢复，npm 残留已移动到临时快照的 卸载残留-npm；最终 Package、命令、进程、端口和 Session 均回到基线
+hard_failures: none
+side_effects: 正式设置和 npm 目录发生预期临时写入；无真实 MCP 网络、OAuth、数据库、监听端口或新 Session
+rollback: 不能只依赖 pi remove；必须恢复 settings 快照，并清除或隔离测试前不存在的 ~/.pi/agent/npm
+decision: continue_testing
+claim_ceiling: 只证明 Adapter 本身在无真实 Server 时的正式加载、trust 路由和可恢复性；不证明任何真实 MCP 的正确性、安全性或收益
+next_gate: 单独申请 M01 / T1；测试 Context7 3.2.5 的真实版本文档、错误版本、离线、超时、惰性启动和回收
 ```
 
 ## 16. 推荐的下一实验顺序
 
-### 第一优先：P08 / T1
+### 已完成：P08 / T1
 
-正式安装 `pi-mcp-adapter@2.15.0`，只加载该 Extension，不配置真实 MCP；验证后卸载并复核 settings、trust、npm lock、资源、认证、进程、端口和外部状态。该动作必须再次得到用户明确批准。
+2026-07-31 已完成正式安装、三种 trust 路径、运行态、卸载和补充回滚。没有配置真实 MCP，也没有批准长期保留。
 
-### 第二优先：M01 / T1
+### 第一优先：M01 / T1
 
 只有 P08 通过后，固定 `@upstash/context7-mcp@3.2.5`，执行真实版本文档任务、错误版本、离线、超时、惰性启动和回收。Context7 通过不自动批准其他 MCP。
 
-### 第三优先：资源型低风险候选
+### 第二优先：资源型低风险候选
 
 Themes → 改造后的 Git/PR Prompt → Deep Research → Statusline。每项单独测试，不打包采用。
 
-### 第四优先：工具与状态
+### 第三优先：工具与状态
 
 Lens → Simplify → Todo。
 
-### 第五优先：Plan → Goal → Subagents
+### 第四优先：Plan → Goal → Subagents
 
 严格顺序，上一项未通过不组合下一项。
 
