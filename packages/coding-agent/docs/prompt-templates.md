@@ -1,96 +1,96 @@
-> pi can create prompt templates. Ask it to build one for your workflow.
+> Pi 可以创建 Prompt Template。你可以让它为自己的工作流构建一个。
 
-# Prompt Templates
+# Prompt Template
 
-Prompt templates are Markdown snippets that expand into full prompts. Type `/name` in the editor to invoke a template, where `name` is the filename without `.md`.
+Prompt Template 是可以展开为完整 Prompt 的 Markdown 片段。在 Editor 中输入 `/name` 即可调用 Template，其中 `name` 是不含 `.md` 的文件名。
 
-## Locations
+## 位置
 
-Pi loads prompt templates from:
+Pi 从以下位置加载 Prompt Template：
 
-- Global: `~/.pi/agent/prompts/*.md`
-- Project: `.pi/prompts/*.md` (only after the project is trusted)
-- Packages: `prompts/` directories or `pi.prompts` entries in `package.json`
-- Settings: `prompts` array with files or directories
-- CLI: `--prompt-template <path>` (repeatable)
+- 全局：`~/.pi/agent/prompts/*.md`
+- 项目：`.pi/prompts/*.md`（仅在项目受信任后）
+- Package：`prompts/` 目录或 `package.json` 中的 `pi.prompts` 条目
+- 设置：包含文件或目录的 `prompts` 数组
+- CLI：`--prompt-template <path>`（可重复使用）
 
-Disable discovery with `--no-prompt-templates`.
+使用 `--no-prompt-templates` 禁用自动发现。
 
-## Format
+## 格式
 
 ```markdown
 ---
-description: Review staged git changes
+description: 检查已暂存的 Git 更改
 ---
-Review the staged changes (`git diff --cached`). Focus on:
-- Bugs and logic errors
-- Security issues
-- Error handling gaps
+检查已暂存的更改（`git diff --cached`），重点关注：
+- Bug 和逻辑错误
+- 安全问题
+- 错误处理缺口
 ```
 
-- The filename becomes the command name. `review.md` becomes `/review`.
-- `description` is optional. If missing, the first non-empty line is used.
-- `argument-hint` is optional. When set, the hint is displayed before the description in the autocomplete dropdown.
+- 文件名会成为命令名称。`review.md` 对应 `/review`。
+- `description` 可选。如果缺少该字段，则使用第一个非空行。
+- `argument-hint` 可选。设置后，提示会显示在自动补全下拉列表的说明之前。
 
-### Argument Hints
+### 参数提示
 
-Use `argument-hint` in frontmatter to show expected arguments in autocomplete. Use `<angle brackets>` for required arguments and `[square brackets]` for optional ones:
+在 Frontmatter 中使用 `argument-hint`，可以在自动补全中显示预期参数。必填参数使用 `<尖括号>`，可选参数使用 `[方括号]`：
 
 ```markdown
 ---
-description: Review PRs from URLs with structured issue and code analysis
+description: 根据 URL 检查 PR，并进行结构化 Issue 与代码分析
 argument-hint: "<PR-URL>"
 ---
 ```
 
-This renders in the autocomplete dropdown as:
+在自动补全下拉列表中显示为：
 
 ```
-→ pr   <PR-URL>       — Review PRs from URLs with structured issue and code analysis
-  is   <issue>        — Analyze GitHub issues (bugs or feature requests)
-  wr   [instructions] — Finish the current task end-to-end
-  cl   — Audit changelog entries before release
+→ pr   <PR-URL>       — 根据 URL 检查 PR，并进行结构化 Issue 与代码分析
+  is   <issue>        — 分析 GitHub Issue（Bug 或功能请求）
+  wr   [instructions] — 端到端完成当前任务
+  cl   — 发布前审计 Changelog 条目
 ```
 
-## Usage
+## 使用
 
-Type `/` followed by the template name in the editor. Autocomplete shows available templates with descriptions.
+在 Editor 中输入 `/`，然后输入 Template 名称。自动补全会显示可用 Template 及其说明。
 
 ```
-/review                           # Expands review.md
-/component Button                 # Expands with argument
-/component Button "click handler" # Multiple arguments
+/review                           # 展开 review.md
+/component Button                 # 带参数展开
+/component Button "click handler" # 多个参数
 ```
 
-## Arguments
+## 参数
 
-Templates support positional arguments, defaults, and simple slicing:
+Template 支持位置参数、默认值和简单切片：
 
-- `$1`, `$2`, ... positional args
-- `$@` or `$ARGUMENTS` for all args joined
-- `${1:-default}` uses arg 1 when present/non-empty, otherwise `default`
-- `${@:-default}` or `${ARGUMENTS:-default}` uses all arguments when present/non-empty, otherwise `default`
-- `${@:N}` for args from the Nth position (1-indexed)
-- `${@:N:L}` for `L` args starting at N
+- `$1`、`$2`……表示位置参数
+- `$@` 或 `$ARGUMENTS` 表示拼接后的全部参数
+- `${1:-default}` 在参数 1 存在且非空时使用该参数，否则使用 `default`
+- `${@:-default}` 或 `${ARGUMENTS:-default}` 在参数存在且非空时使用全部参数，否则使用 `default`
+- `${@:N}` 表示从第 N 个位置开始的参数（从 1 开始计数）
+- `${@:N:L}` 表示从 N 开始的 `L` 个参数
 
-Example:
+示例：
 
 ```markdown
 ---
-description: Create a component
+description: 创建组件
 ---
-Create a React component named $1 with features: $@
+创建名为 $1 的 React 组件，并包含以下功能：$@
 ```
 
-Default values are useful for optional arguments:
+默认值适用于可选参数：
 
 ```markdown
-Summarize the current state in ${1:-7} bullet points.
+使用 ${1:-7} 个要点总结当前状态。
 ```
 
-Usage: `/component Button "onClick handler" "disabled support"`
+用法：`/component Button "onClick handler" "disabled support"`
 
-## Loading Rules
+## 加载规则
 
-- Template discovery in `prompts/` is non-recursive.
-- If you want templates in subdirectories, add them explicitly via `prompts` settings or a package manifest.
+- `prompts/` 中的 Template 自动发现不会递归。
+- 如果需要加载子目录中的 Template，请通过 `prompts` 设置或 Package Manifest 显式添加。
