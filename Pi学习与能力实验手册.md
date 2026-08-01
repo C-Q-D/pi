@@ -1223,10 +1223,10 @@ rollback_chain: pi remove 后把 mcp.json、mcp-cache.json、npm 和 Context7 �
 final_chain: 重新安装后的全新 Pi 会话通过 Context7 解析 /microsoft/typescript；约 17.5 秒；Pi exit 0；残留 0
 final_state: pi-mcp-adapter@2.15.0 与 Context7 3.2.5 长期保留；settings SHA256 B92857174EAE191AC4CF3DC192C8451CF40F0C51DEB715C4B649CC8D607535BB；mcp.json SHA256 05B9C88B5ABFABE1C73808FEA9544F4CA7F2F3939B30713C00B75D8C28A8650B；auth 哈希未变
 evidence: C:\Users\Administrator\AppData\Local\PiR1Backups\context7-20260801-224828
-process_audit_correction: 安装前发现并按精确命令行清理 62 个旧 cmd/npx Context7 或诊断 fixture 进程；禁止再用公共父进程树作为所有权依据
+process_audit_correction: 安装前发现并按精确命令行清理 62 个旧 cmd/npx Context7 或诊断 fixture 进程；最终审计又出现两组 cmd/npx Context7，已定位为 ~/.codex/config.toml 与 ~/.codex/config-codexcont.toml 中的 Codex Desktop MCP 配置重新启动，不属于正式 Pi 的稳定路径进程；禁止再用公共父进程树作为所有权依据
 operator_error: 首次清理错误地把 Codex Desktop 公共 app-server 当作诊断父进程，命令在终止当前运行器时中断，并可能中断另一个项目的 Rust 测试；正式 Pi 与本仓库 Git 未改变，未越权重启其他项目任务；后续只按精确命令行清理
 installer_correction: npm init --prefix 在当前 npm 上忽略 prefix 并临时改写仓库根 package.json；已用机械删除撤销本轮新增字段，最终 Git diff 为零
-limitations: Context7 的错误版本和网络失败仍返回 isError=false；无人值守流程必须检查 details.error 与错误文本；尚未证明长期重复稳定性或未来版本兼容性
+limitations: Context7 的错误版本和网络失败仍返回 isError=false；无人值守流程必须检查 details.error 与错误文本；Codex Desktop 仍有独立的 npx Context7 配置，会产生外部同名进程但不影响 Pi；尚未证明长期重复稳定性或未来版本兼容性
 decision: retain_R1
 next_gate: 日常使用并观察重复稳定性；升级 Adapter、Context7、Node 路径或加入其他 MCP 前重新执行独立准入与纵向验收
 ```
