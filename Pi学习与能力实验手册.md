@@ -128,10 +128,10 @@
 | Thinking | `max` |
 | 认证 | OpenAI Codex OAuth；测试前后只比较哈希，不在本文保存令牌 |
 | `defaultProjectTrust` | 保持隐式默认值 `ask`；当前没有 `trust.json` |
-| 正式第三方 Pi Package | 1：`pi-mcp-adapter@2.15.0` |
+| 正式第三方 Pi Package | 2：`pi-mcp-adapter@2.15.0`、`@victor-software-house/pi-curated-themes@0.2.1`（仅启用单一 Theme） |
 | 正式 MCP Server | 1：`@upstash/context7-mcp@3.2.5`，固定目录、Node 直接启动 |
-| 正式 Pi 专属 Prompt / Skill / Theme | 0；当前主题为内置 `dark` |
-| 正式采用的变化 | `defaultThinkingLevel=max` |
+| 正式 Pi 专属 Prompt / Skill / Theme | Prompt 0、Skill 0、第三方 Theme 1：`github-dark-high-contrast` |
+| 正式采用的变化 | `defaultThinkingLevel=max`；默认主题为 `github-dark-high-contrast` |
 
 2026-07-31 已完成本地个人版 Pi 0.83.0 基线复验：
 
@@ -966,7 +966,7 @@ FxTwitter、Web Clipper、yt-dlp、Agent Reach 等只是候选适配器。登录
 
 | ID | 精确候选 | 用途 | 当前证据 | 下一步 | 关联 X |
 |---|---|---|---|---|---|
-| P01 | `@victor-software-house/pi-curated-themes@0.2.1` | 终端主题与可读性 | T1 完整通过；`github-dark-high-contrast` 在真实 Windows PTY 中完成 Markdown、代码、成功/错误、Diff、选择器、重启和卸载回退 | 可申请 R1；只保留 themes，禁用包内附带 Skill | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
+| P01 | `@victor-software-house/pi-curated-themes@0.2.1` | 终端主题与可读性 | T1 与 R1 完整通过；`github-dark-high-contrast` 在真实 Windows PTY 中完成 Markdown、代码、成功/错误、Diff、选择器、重启和回退 | R1 长期保留；`autoload=false`，只放行单一 Theme，包内 Skill 未启用 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
 | P02 | `@firstpick/pi-prompts-git-pr@0.1.5` | Git/PR 显式 Prompt | 资源兼容/恢复通过 | 先 T0 改为中文、默认不 push | [#33](https://x.com/KyrieCheungYep/status/2068306688651018272) |
 | P03 | `@firstpick/pi-skill-deep-research@0.1.8` | 结构化研究流程参考 | Skill 资源兼容/恢复通过 | Windows 命令与真实研究增量 T0 | [#23](https://x.com/HiTw93/status/2039713457952706686) |
 | P04 | `@narumitw/pi-statusline@0.34.0` | 显示模型、上下文和状态 | 可加载；留下配置 | T1 前接受持久配置、字段与开销测试 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
@@ -1025,14 +1025,14 @@ P13 自带 Oracle profile 虽提示只读，但工具列表含 `bash`；未经�
 - P14 只到静态 E0；
 - 上游配置曾声明自定义 `chrome-devtools` Skill，但该 Skill 不在固定 `pi-config` 仓库中，不能把声明当作已恢复资源；
 - 所有动态测试均为单项或一条窄 MCP 假服务链；
-- P08 与 M01 已作为一条 Context7 用途链取得 R1；P01 已通过 T1 并完成卸载，可单独申请 R1；其他第三方候选仍未取得长期采用资格。
+- P08 与 M01 已作为一条 Context7 用途链取得 R1；P01 已取得单独 R1 并只启用 `github-dark-high-contrast` Theme；其他第三方候选仍未取得长期采用资格。
 
 ## 15. 已完成的关键实验
 
 | 实验 | 结果 | 可以证明 | 不能证明 | 相关 X |
 |---|---|---|---|---|
 | 本地个人版 Pi 0.83.0 基线复验 | 10/10 | 当前全局命令指向个人版发布；默认 Luna/max；真实请求成功；认证与设置不变；无运行残留 | 交互式 TUI、项目 trust 三态、构建与完整测试套件 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
-| P01 / T1 主题真实用途链 | 通过；已卸载并逐字节恢复基线 | 精确 Package 可安装；候选主题能在真实 Windows PTY 中区分 Markdown、代码、错误、成功和 Diff；`/theme` 可选择；重启后保持；可完整回退 | 长期个人偏好、不同终端/显示器效果、包内附带 Skill 的长期资源过滤和未来版本兼容性 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
+| P01 / T1 与 R1 主题真实用途链 | 通过；正式长期保留 | 精确 Package 可安装；候选主题能在真实 Windows PTY 中区分 Markdown、代码、错误、成功和 Diff；`/theme` 可选择；重启后保持；单一 Theme 过滤有效；可完整回退 | 长期个人偏好、不同终端/显示器效果和未来版本兼容性 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
 | P08 / T1 正式安装—验证—卸载 | 通过；发现并清理卸载残留 | 精确 Package 可安装；Adapter 在 trusted、untrusted 和默认 ask 下按预期加载；Luna/max 不变；可完整回滚 | 真实 MCP Server、工具调用、OAuth、长期保留和组合行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | P08→M01 真实 Context7 用途链 | 功能主链通过；韧性门失败 | Pi 能通过 Adapter 惰性连接 Context7，解析库 ID 并查询指定版本官方文档；错误版本和离线可被模型识别 | 错误结果可被机器可靠识别、失败路径及时退出、长期稳定性和长期保留资格 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
 | P08→M01 韧性诊断与 Node 直启复验 | 条件化通过；可申请 R1 | `cmd /c` 是孙进程残留原因；Node 直启固定版本在正常、错误版本、离线三链均及时回收；错误文本来源边界已定位 | 无人值守消费者只检查 `isError` 仍不安全；尚未批准长期安装 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
@@ -1266,19 +1266,44 @@ claim_ceiling: 证明当前 Windows/Pi/固定版本上的真实 TUI 可用性、
 next_gate: 用户单独批准 R1 后，重新安装精确版本，只启用 themes，正式选择 github-dark-high-contrast，并做一次无 --theme 的重启验收；不得加载包内附带 Skill
 ```
 
+### 15.7 P01 主题 R1 长期安装与资源过滤验收
+
+```text
+candidate_id: P01
+exact_version: @victor-software-house/pi-curated-themes@0.2.1
+last_tested: 2026-08-02 Asia/Shanghai
+runtime: 本地个人版 Pi 0.83.0 / Windows / Node v24.17.0 / Windows PTY / truecolor
+goal: 长期安装已通过 T1 的 github-dark-high-contrast，同时机械排除 Package 附带 Skill
+baseline: custom/main HEAD 与 origin/custom/main 均为 73fc26bd7d46fc7cb596b0e5a59938d7477a1b42；Git 干净；正式主题 dark；正式 Package 仅 pi-mcp-adapter@2.15.0
+snapshot: C:\Users\Administrator\AppData\Local\PiR1Backups\curated-themes-20260802-134224
+install: pi install npm:@victor-software-house/pi-curated-themes@0.2.1；新增 1 个 Package，审计 120 个 Package，0 vulnerability
+filter: Package 对象设置 autoload=false，只显式放行 +themes/github-dark-high-contrast.json；未放行 Extension、Skill 或 Prompt
+resource_validation: pi list 将 Package 标记为 filtered；正常 Skill 发现的 RPC get_commands 成功，未出现 adapt-ghostty-theme-to-pi
+restart_chain: 不传 --theme 的两次全新 Pi TUI 均显示相同候选配色；Markdown、错误、Diff 删除行和 Diff 新增行均可见
+network: 仅安装时访问 npm registry；运行验收使用 --offline 和预制 Session，不调用模型
+credentials: 未新增凭据；auth.json SHA256 前后保持 425ABA0EA755B68147DA1B26E36E40EF9369975DA046DB6383BC59BCE8EB43D3
+final_state: theme=github-dark-high-contrast；settings SHA256 7D6F7A21C7BB4678765506CE2655B84AADF00D9FC5BA77DBB16F7ABAB4E31E61；npm package.json SHA256 F6CACFD2DB9D224B0CB093103D1B12ECBDB34BF06663A92C00BEB102A05204BA；package-lock.json SHA256 D302026B9BCA9A570E922A449D8BD62EA378755DC68809B33B88C806766B1D2A
+residual_state: Pi CLI node.exe 进程为 0；没有新增凭据、正式 Session、端口、Extension、Skill 或 Prompt
+harness_correction: 首次 RPC 请求被 PowerShell 管道写入 UTF-8 BOM，Pi 在解析层拒绝；改用无 BOM UTF-8 后 get_commands 成功。首次结果不用于资源过滤结论
+rollback: 先把 theme 改回 dark，再运行 pi remove npm:@victor-software-house/pi-curated-themes@0.2.1；必要时使用快照恢复 settings.json 与 npm metadata
+decision: retain_R1
+claim_ceiling: 证明当前 Windows/Pi/固定版本下单一 Theme 的长期配置、重启持久性和 Skill 排除；不证明未来版本或所有终端显示效果
+next_gate: 日常使用观察视觉疲劳和不同终端效果；升级 Package 或启用其他 Theme/Skill 前重新测试并授权
+```
+
 ## 16. 推荐的下一实验顺序
 
 ### 已完成：P08 单组件 T1、P08→M01 功能主链、韧性诊断与 R1
 
 2026-08-01 已完成 Adapter 与 Context7 的长期安装、正常查询、错误版本、离线、重启、卸载、恢复和最终交付验证。正式 Pi 已长期保留 P08+M01 组合，采用固定版本、稳定目录和 Node 直接启动。
 
-### 已完成：P01 主题 T1
+### 已完成：P01 主题 T1 与 R1
 
-2026-08-02 已完成 `@victor-software-house/pi-curated-themes@0.2.1` 的安装、真实 Windows PTY 对照、`/theme` 选择、正式设置、两次启动持久性和完整卸载。`github-dark-high-contrast` 取得 `request_R1` 结论，但当前未长期安装；R1 必须只启用 themes，并禁用包内附带 Skill。
+2026-08-02 已完成 `@victor-software-house/pi-curated-themes@0.2.1` 的安装、真实 Windows PTY 对照、`/theme` 选择、完整卸载、R1 重装、资源过滤和两次启动持久性。正式 Pi 长期使用 `github-dark-high-contrast`；Package 设置为 `autoload=false`，只放行这一份 Theme，包内附带 Skill 未启用。
 
 ### 第一优先：资源型低风险候选
 
-改造后的 Git/PR Prompt → Deep Research → Statusline。每项单独测试，不打包采用。Themes 已完成 T1，等待用户决定是否进入独立 R1。
+改造后的 Git/PR Prompt → Deep Research → Statusline。每项单独测试，不打包采用。Themes 已完成独立 R1。
 
 ### 第二优先：工具与状态
 
