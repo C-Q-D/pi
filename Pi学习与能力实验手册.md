@@ -1032,7 +1032,7 @@ P13 自带 Oracle profile 虽提示只读，但工具列表含 `bash`；未经�
 | 实验 | 结果 | 可以证明 | 不能证明 | 相关 X |
 |---|---|---|---|---|
 | 本地个人版 Pi 0.83.0 基线复验 | 10/10 | 当前全局命令指向个人版发布；默认 Luna/max；真实请求成功；认证与设置不变；无运行残留 | 交互式 TUI、项目 trust 三态、构建与完整测试套件 | [#45](https://x.com/0xCodez/status/2078108100351943130) |
-| P01 / T1 与 R1 主题真实用途链 | 通过；正式长期保留 | 精确 Package 可安装；候选主题能在真实 Windows PTY 中区分 Markdown、代码、错误、成功和 Diff；`/theme` 可选择；重启后保持；单一 Theme 过滤有效；可完整回退 | 长期个人偏好、不同终端/显示器效果和未来版本兼容性 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
+| P01 / T1 与 R1 主题真实用途链 | 通过；正式长期保留 | 精确 Package 可安装；候选主题能在真实 Windows PTY 中区分 Markdown、代码、错误、成功和 Diff；`/settings → Theme` 可确认和选择；重启后保持；单一 Theme 过滤有效；可完整回退 | 长期个人偏好、不同终端/显示器效果和未来版本兼容性 | [#49](https://x.com/Nozelcode/status/2078217384750682452) |
 | P08 / T1 正式安装—验证—卸载 | 通过；发现并清理卸载残留 | 精确 Package 可安装；Adapter 在 trusted、untrusted 和默认 ask 下按预期加载；Luna/max 不变；可完整回滚 | 真实 MCP Server、工具调用、OAuth、长期保留和组合行为 | [#5](https://x.com/shitunote/status/2079077524097597774) |
 | P08→M01 真实 Context7 用途链 | 功能主链通过；韧性门失败 | Pi 能通过 Adapter 惰性连接 Context7，解析库 ID 并查询指定版本官方文档；错误版本和离线可被模型识别 | 错误结果可被机器可靠识别、失败路径及时退出、长期稳定性和长期保留资格 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
 | P08→M01 韧性诊断与 Node 直启复验 | 条件化通过；可申请 R1 | `cmd /c` 是孙进程残留原因；Node 直启固定版本在正常、错误版本、离线三链均及时回收；错误文本来源边界已定位 | 无人值守消费者只检查 `isError` 仍不安全；尚未批准长期安装 | [#3](https://x.com/systemdesignone/status/2079182252366340510) |
@@ -1253,7 +1253,8 @@ install: pi install npm:@victor-software-house/pi-curated-themes@0.2.1；新增 
 fixture: 预制 Session 同时包含中文 Markdown、TypeScript 代码块、read 成功、bash 错误、edit 成功 Diff 和最终总结；不向模型发送 Prompt
 baseline_chain: 内置 dark 在真实 PTY 中显示完整 fixture；实际颜色包括 #8abeb7、#b5bd68、#cc6666、#283228 和 #3c2828
 candidate_chain: github-dark-high-contrast 在同一 PTY 和 fixture 中显示完整内容；实际颜色包括 accent #71b7ff、success #26cd4d、warning #f0b72f、error #ff9492、diffAdded #a3e4b5 和 diffRemoved #f6cbcc
-selector_chain: /theme 选择器真实打开并出现 github-dark-high-contrast；Enter 后隔离 settings.json 正确保留该主题
+selector_chain_correction: 原捕获脚本向 Pi 输入 /theme 后，只以输出是否含 github-dark-high-contrast 判断选择器出现；该名称本来就可能来自既有配置或输出，因此是无效断言。Pi 0.83.0 没有 /theme 命令，正确入口是 /settings → Theme
+manual_selector_chain: 2026-08-02 用户在 F:\tmp 的正式 Pi 中进入 /settings → Theme，界面列出 Automatic、dark、github-dark-high-contrast 和 light，并以箭头高亮 github-dark-high-contrast 为当前值
 restart_chain: 正式 settings.json 临时选择候选后，在不传 --theme 的两次全新 Pi 启动中得到完全一致的候选语义配色，证明 Package 发现和设置持久化有效
 harness_corrections: pywinpty 的实际字符串参数类型与签名提示不一致，且全局 pi.ps1 使用 PATH 中的 E:\nodejs\node.exe；均在 Pi 启动边界或捕获序列化处修正。首次颜色对照因 NO_COLOR 变量存在而无颜色，移除变量并声明 truecolor 后重跑；--theme 只加载资源、不负责选择主题，因此改用隔离 settings.json 做有效对照
 rollback: 先把正式 theme 恢复为 dark，再运行 pi remove；正式 settings、npm package.json 和 package-lock.json 的 SHA256 均与测试前快照逐字节一致，候选 node_modules 目录不存在
@@ -1263,7 +1264,7 @@ real_benefit: 相对内置 dark，候选在同一内容上为主要语义状态�
 limitations: 每个正式启动只运行 1 次；没有测试浅色主题、不同终端背景、低色深终端或长时间视觉疲劳；Package 同时声明一个额外 Skill，长期安装前必须配置资源过滤，不能依赖全局 --no-skills
 decision: request_R1
 claim_ceiling: 证明当前 Windows/Pi/固定版本上的真实 TUI 可用性、持久化和完整回退；不证明长期个人偏好、其他环境或未来版本
-next_gate: 用户单独批准 R1 后，重新安装精确版本，只启用 themes，正式选择 github-dark-high-contrast，并做一次无 --theme 的重启验收；不得加载包内附带 Skill
+next_gate: R1 已按 15.7 完成；选择或确认主题必须使用 /settings → Theme，不得再使用不存在的 /theme
 ```
 
 ### 15.7 P01 主题 R1 长期安装与资源过滤验收
@@ -1280,6 +1281,8 @@ install: pi install npm:@victor-software-house/pi-curated-themes@0.2.1；新增 
 filter: Package 对象设置 autoload=false，只显式放行 +themes/github-dark-high-contrast.json；未放行 Extension、Skill 或 Prompt
 resource_validation: pi list 将 Package 标记为 filtered；正常 Skill 发现的 RPC get_commands 成功，未出现 adapt-ghostty-theme-to-pi
 restart_chain: 不传 --theme 的两次全新 Pi TUI 均显示相同候选配色；Markdown、错误、Diff 删除行和 Diff 新增行均可见
+manual_validation: 用户在 F:\tmp 输入 /settings 并进入 Theme，github-dark-high-contrast 被高亮为当前主题，候选发现和正式设置在人机界面中一致
+command_correction: Pi 0.83.0 只用 /settings 打开设置；/theme 不存在。正式 Session 2026-08-02T05-53-06-639Z_019fc108-7c4f-7e8b-9117-d76ed7835d36.jsonl 证明精确输入 /theme 后下一条为 Assistant 消息并触发模型读文档。该现象不是主题安装或资源过滤失败
 network: 仅安装时访问 npm registry；运行验收使用 --offline 和预制 Session，不调用模型
 credentials: 未新增凭据；auth.json SHA256 前后保持 425ABA0EA755B68147DA1B26E36E40EF9369975DA046DB6383BC59BCE8EB43D3
 final_state: theme=github-dark-high-contrast；settings SHA256 7D6F7A21C7BB4678765506CE2655B84AADF00D9FC5BA77DBB16F7ABAB4E31E61；npm package.json SHA256 F6CACFD2DB9D224B0CB093103D1B12ECBDB34BF06663A92C00BEB102A05204BA；package-lock.json SHA256 D302026B9BCA9A570E922A449D8BD62EA378755DC68809B33B88C806766B1D2A
@@ -1299,7 +1302,7 @@ next_gate: 日常使用观察视觉疲劳和不同终端效果；升级 Package 
 
 ### 已完成：P01 主题 T1 与 R1
 
-2026-08-02 已完成 `@victor-software-house/pi-curated-themes@0.2.1` 的安装、真实 Windows PTY 对照、`/theme` 选择、完整卸载、R1 重装、资源过滤和两次启动持久性。正式 Pi 长期使用 `github-dark-high-contrast`；Package 设置为 `autoload=false`，只放行这一份 Theme，包内附带 Skill 未启用。
+2026-08-02 已完成 `@victor-software-house/pi-curated-themes@0.2.1` 的安装、真实 Windows PTY 对照、`/settings → Theme` 人工确认、完整卸载、R1 重装、资源过滤和两次启动持久性。正式 Pi 长期使用 `github-dark-high-contrast`；Package 设置为 `autoload=false`，只放行这一份 Theme，包内附带 Skill 未启用。早期 `/theme` 选择器断言是测试假阳性，已由正式 Session、本地代码、文档和人工界面证据纠正。
 
 ### 第一优先：资源型低风险候选
 
