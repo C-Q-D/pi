@@ -262,3 +262,13 @@ tmux kill-session -t pi-test
 ## 用户覆盖
 
 如果用户指令与本文档中的任何规则冲突，在覆盖规则前必须请求用户明确确认。只有确认后才能执行用户指令。
+
+<!-- codex-plan-index:start -->
+## 当前计划索引
+
+| 计划 ID | 类型 | 文档 |
+|---|---|---|
+| SCOPE-REMOTE-COMPACTION-001 | 产品拆分 | [原生远端上下文压缩产品拆分](docs/开发计划/产品拆分-原生远端上下文压缩.md) |
+| ATOMIC-REMOTE-COMPACTION-001 | 原子开发 | [原生远端上下文压缩原子计划](docs/开发计划/原子开发计划-原生远端上下文压缩.md) |
+
+<!-- codex-plan-index:end -->
