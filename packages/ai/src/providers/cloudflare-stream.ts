@@ -1,4 +1,4 @@
-import type { Api, Model, ProviderEnv, ProviderStreams } from "../types.ts";
+import type { Api, Model, ProviderEnv, ProviderStreamMethods, ProviderStreams } from "../types.ts";
 
 const CLOUDFLARE_ACCOUNT_ID = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_GATEWAY_ID = "CLOUDFLARE_GATEWAY_ID";
@@ -18,7 +18,7 @@ export function resolveCloudflareModel<TApi extends Api>(
  * Wrap an API implementation so Cloudflare account/gateway endpoint
  * placeholders materialize from the resolved provider env before dispatch.
  */
-export function cloudflareStreams(streams: ProviderStreams): ProviderStreams {
+export function cloudflareStreams(streams: ProviderStreamMethods): ProviderStreams {
 	return {
 		stream: (model, context, options) =>
 			streams.stream(resolveCloudflareModel(model, options?.env), context, options),

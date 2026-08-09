@@ -20,6 +20,8 @@ import type {
 	Context,
 	ImageContent,
 	Model,
+	NativeCompactionEndpoint,
+	NativeCompactionPublicOptionsMap,
 	StopReason,
 	TextContent,
 	TextSignatureV1,
@@ -31,6 +33,8 @@ import type {
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
+import { createNativeCompactionError } from "../utils/native-compaction.ts";
+import { validateNativeCompactionEndpoint } from "../utils/native-endpoint.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import {
 	appendGrammarToolInputJsonDelta,
@@ -44,6 +48,22 @@ import { transformMessages } from "./transform-messages.ts";
 // =============================================================================
 // Utilities
 // =============================================================================
+
+/** Resolve the stable Public Responses compaction endpoint without loading the OpenAI SDK. */
+export function resolveOpenAIResponsesCompactionEndpoint(
+	model: Readonly<Model<"openai-responses">>,
+	_options: Readonly<NativeCompactionPublicOptionsMap["openai-responses"]>,
+): NativeCompactionEndpoint<"openai-responses"> {
+	try {
+		if (model.baseUrl.includes("?")) throw createNativeCompactionError("protocol");
+		return validateNativeCompactionEndpoint("openai-responses", {
+			endpoint: model.baseUrl,
+			protocol: "openai-responses-compact",
+		});
+	} catch {
+		throw createNativeCompactionError("protocol");
+	}
+}
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
 	const payload: TextSignatureV1 = { v: 1, id };

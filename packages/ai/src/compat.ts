@@ -54,8 +54,8 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	Model,
+	ProviderStreamMethods,
 	ProviderStreamOptions,
-	ProviderStreams,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -201,7 +201,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	};
 }
 
-const BUILTIN_APIS: [Api, ProviderStreams][] = [
+const BUILTIN_APIS: [Api, ProviderStreamMethods][] = [
 	["anthropic-messages", anthropicMessagesApi()],
 	["openai-completions", openAICompletionsApi()],
 	["openai-responses", openAIResponsesApi()],
