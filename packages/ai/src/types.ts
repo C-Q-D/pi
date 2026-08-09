@@ -484,10 +484,87 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	constrainedSampling?: false | ConstrainedSamplingConfig;
 }
 
+/** JSON 中可直接表示的原始值。 */
+export type JsonPrimitive = string | number | boolean | null;
+
+/** 只包含 JSON 值的只读对象。 */
+export interface JsonObject {
+	readonly [key: string]: JsonValue;
+}
+
+/** Provider Context 允许保存的递归 JSON 值。 */
+export type JsonValue = JsonPrimitive | JsonObject | readonly JsonValue[];
+
+/** Provider Context 当前支持的远端压缩协议。 */
+export type NativeCompactionProtocol =
+	| "openai-responses-compact"
+	| "openai-codex-remote-v2"
+	| "openai-codex-compact-legacy";
+
+/** 把不透明 Provider Context 绑定到生成它的完整请求身份。 */
+export interface ProviderContextBinding {
+	/** 生成上下文的 Provider ID。 */
+	readonly provider: string;
+	/** 生成上下文的 API ID。 */
+	readonly api: Api;
+	/** 生成上下文的精确模型 ID。 */
+	readonly model: string;
+	/** Adapter 已解析完成的稳定 Endpoint Identity。 */
+	readonly endpoint: string;
+	/** Provider Context 的固定封装格式。 */
+	readonly format: "openai-responses-compaction";
+	/** 生成并消费上下文所使用的远端协议。 */
+	readonly protocol: NativeCompactionProtocol;
+	/** 当前有效凭据范围的 SHA-256 指纹。 */
+	readonly credentialScopeHash: string;
+}
+
+/** 可持久化但只能由匹配 Provider 消费的不透明远端上下文。 */
+export interface ProviderContextEnvelope {
+	/** Provider Context 的固定封装格式。 */
+	readonly format: "openai-responses-compaction";
+	/** 当前封装版本。 */
+	readonly version: 1;
+	/** 上下文与有效请求身份之间的精确绑定。 */
+	readonly binding: ProviderContextBinding;
+	/** Provider 返回并通过运行时校验的 canonical JSON Items。 */
+	readonly items: readonly JsonValue[];
+}
+
+/** 远端压缩公开的最小 Token 用量。 */
+export interface NativeCompactionUsage {
+	/** Provider 接收的输入 Token 数。 */
+	readonly inputTokens: number;
+	/** Provider 产生的输出 Token 数。 */
+	readonly outputTokens: number;
+	/** Provider 报告的总 Token 数。 */
+	readonly totalTokens: number;
+}
+
+/** Provider 原生压缩返回的闭合结果。 */
+export interface NativeCompactionResult {
+	/** 后续请求必须携带的已验证 Provider Context。 */
+	readonly providerContext: ProviderContextEnvelope;
+	/** Provider 能安全公开时返回的规范化 Token 用量。 */
+	readonly usage?: NativeCompactionUsage;
+}
+
+/** Provider 原生压缩对外公开的固定安全错误码。 */
+export type NativeCompactionErrorCode =
+	| "unsupported"
+	| "invalid_context"
+	| "binding_mismatch"
+	| "capacity"
+	| "protocol"
+	| "aborted"
+	| "provider_error";
+
 export interface Context {
 	systemPrompt?: string;
 	messages: Message[];
 	tools?: Tool[];
+	/** 当前会话可选的、已绑定 Provider 原生上下文。 */
+	readonly providerContext?: ProviderContextEnvelope;
 }
 
 /**
