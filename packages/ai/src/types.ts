@@ -225,6 +225,90 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 	? ApiOptionsMap[TApi]
 	: StreamOptions & Record<string, unknown>;
 
+/** 首版允许使用 Provider 原生压缩的两个独立 API。 */
+export type NativeCompactionApi = "openai-responses" | "openai-codex-responses";
+
+/** 两个原生压缩 Adapter 共同允许的公开运行时选项。 */
+type NativeCompactionCommonOptions = Readonly<
+	Pick<
+		StreamOptions,
+		| "signal"
+		| "apiKey"
+		| "fetch"
+		| "headers"
+		| "timeoutMs"
+		| "maxRetries"
+		| "maxRetryDelayMs"
+		| "env"
+		| "onPayload"
+		| "onResponse"
+		| "sessionId"
+		| "cacheRetention"
+	>
+>;
+
+/** 按 `model.api` 闭合的原生压缩公开选项，两个认证路径不互相借用字段。 */
+export interface NativeCompactionPublicOptionsMap {
+	"openai-responses": NativeCompactionCommonOptions &
+		Readonly<Pick<OpenAIResponsesOptions, "reasoningEffort" | "reasoningSummary" | "serviceTier">>;
+	"openai-codex-responses": NativeCompactionCommonOptions &
+		Readonly<
+			Pick<OpenAICodexResponsesOptions, "reasoningEffort" | "reasoningSummary" | "serviceTier" | "textVerbosity">
+		>;
+}
+
+/** 每个原生压缩 API 独立允许的协议。 */
+export interface NativeCompactionProtocolMap {
+	"openai-responses": "openai-responses-compact";
+	"openai-codex-responses": "openai-codex-remote-v2" | "openai-codex-compact-legacy";
+}
+
+/** Adapter 解析出的稳定 Endpoint 与按 API 收窄的原生压缩协议。 */
+export interface NativeCompactionEndpoint<TApi extends NativeCompactionApi = NativeCompactionApi> {
+	readonly endpoint: string;
+	readonly protocol: NativeCompactionProtocolMap[TApi];
+}
+
+declare const nativeCompactionProviderRequestBrand: unique symbol;
+
+/** 只能由 Models Preflight 创建并在运行时登记的 Provider 请求。 */
+export interface NativeCompactionProviderRequest<TApi extends NativeCompactionApi = NativeCompactionApi> {
+	readonly [nativeCompactionProviderRequestBrand]: true;
+	readonly model: Readonly<Model<TApi>>;
+	readonly context: Readonly<Omit<Context, "providerContext">>;
+	readonly options: Readonly<NativeCompactionPublicOptionsMap[TApi]>;
+	readonly binding: ProviderContextBinding;
+	/** 唯一经过验证的 Provider Context 真相源。 */
+	readonly providerContext?: ProviderContextEnvelope;
+}
+
+/** Provider 原生压缩必须成套实现的三个能力。 */
+export interface NativeCompactionProviderCapabilities<TApi extends NativeCompactionApi = NativeCompactionApi> {
+	readonly compact: (request: NativeCompactionProviderRequest<TApi>) => Promise<NativeCompactionResult>;
+	readonly canConsumeProviderContext: (request: NativeCompactionProviderRequest<TApi>) => Promise<boolean>;
+	readonly resolveNativeCompactionEndpoint: (
+		model: Readonly<Model<TApi>>,
+		options: Readonly<NativeCompactionPublicOptionsMap[TApi]>,
+	) => NativeCompactionEndpoint<TApi>;
+}
+
+/** 显式禁止只实现原生压缩三件套中的一部分。 */
+export interface NoNativeCompactionProviderCapabilities {
+	readonly compact?: undefined;
+	readonly canConsumeProviderContext?: undefined;
+	readonly resolveNativeCompactionEndpoint?: undefined;
+}
+
+/** 根据 Provider 的 API 集合计算可用的原生压缩 API。 */
+export type NativeCompactionApiFor<TApi extends Api> = Extract<TApi, NativeCompactionApi>;
+
+/** Provider 可选择完整实现原生压缩，或完全不暴露该能力。 */
+export type OptionalNativeCompactionProviderCapabilities<TApi extends Api> = [NativeCompactionApiFor<TApi>] extends [
+	never,
+]
+	? NoNativeCompactionProviderCapabilities
+	: NativeCompactionProviderCapabilities<NativeCompactionApiFor<TApi>> | NoNativeCompactionProviderCapabilities;
+
 /**
  * The uniform stream contract of an API implementation module: every module
  * under `src/api/` exports exactly `stream` and `streamSimple`, so the module
@@ -233,10 +317,14 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
  * per-API option typing lives on the implementation modules themselves and on
  * `Provider.stream()` via `ApiStreamOptions`.
  */
-export interface ProviderStreams {
+export interface ProviderStreamMethods {
 	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
 	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
 }
+
+/** 普通流能力与可选、不可拆分的原生压缩三件套。 */
+export type ProviderStreams<TApi extends Api = never> = ProviderStreamMethods &
+	OptionalNativeCompactionProviderCapabilities<TApi>;
 
 /**
  * The uniform contract of an image-generation API implementation module:

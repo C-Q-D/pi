@@ -40,6 +40,7 @@ const NATIVE_COMPACTION_ERROR_MESSAGES = {
 } as const satisfies Record<NativeCompactionErrorCode, string>;
 
 const VALIDATION_FAILURE_CODES = new WeakMap<object, NativeCompactionErrorCode>();
+const NATIVE_COMPACTION_ERROR_CODES = new WeakMap<object, NativeCompactionErrorCode>();
 
 /** 仅在模块内部流转、不会暴露原异常内容的校验失败。 */
 class NativeCompactionValidationFailure extends Error {
@@ -58,6 +59,7 @@ export class NativeCompactionError extends Error {
 		super(NATIVE_COMPACTION_ERROR_MESSAGES[code]);
 		this.name = "NativeCompactionError";
 		this.code = code;
+		NATIVE_COMPACTION_ERROR_CODES.set(this, code);
 		Object.freeze(this);
 	}
 }
@@ -65,6 +67,16 @@ export class NativeCompactionError extends Error {
 /** 创建不接受自定义消息、Cause 或 Details 的固定安全错误。 */
 export function createNativeCompactionError(code: NativeCompactionErrorCode): NativeCompactionError {
 	return new NativeCompactionError(code);
+}
+
+/** 保留本模块产生的固定错误码，并把其他异常替换为指定安全错误。 */
+export function sanitizeNativeCompactionError(
+	error: unknown,
+	fallbackCode: NativeCompactionErrorCode,
+): NativeCompactionError {
+	const isObject = (typeof error === "object" && error !== null) || typeof error === "function";
+	const code = (isObject ? NATIVE_COMPACTION_ERROR_CODES.get(error) : undefined) ?? fallbackCode;
+	return createNativeCompactionError(code);
 }
 
 /** 把未知异常统一替换为指定安全错误，不复制原异常文本。 */

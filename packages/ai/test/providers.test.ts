@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { envApiKeyAuth } from "../src/auth/helpers.ts";
 import type { AuthContext, AuthEvent } from "../src/auth/types.ts";
-import { createModels, createProvider } from "../src/models.ts";
+import { assertNativeCompactionProviderRequest, createModels, createProvider, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import { builtinModels, builtinProviders, getBuiltinModel } from "../src/providers/all.ts";
 import { amazonBedrockProvider } from "../src/providers/amazon-bedrock.ts";
@@ -10,8 +10,18 @@ import { cloudflareAIGatewayProvider } from "../src/providers/cloudflare-ai-gate
 import { cloudflareWorkersAIProvider } from "../src/providers/cloudflare-workers-ai.ts";
 import { fauxAssistantMessage, fauxProvider } from "../src/providers/faux.ts";
 import { googleVertexProvider } from "../src/providers/google-vertex.ts";
-import type { Api, Context, Model, ProviderStreams } from "../src/types.ts";
+import type {
+	Api,
+	Context,
+	Model,
+	NativeCompactionApi,
+	NativeCompactionProviderCapabilities,
+	NativeCompactionProviderRequest,
+	NativeCompactionPublicOptionsMap,
+	ProviderStreams,
+} from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { createNativeCompactionError, NativeCompactionError } from "../src/utils/native-compaction.ts";
 
 function fakeAuthContext(env: Record<string, string>, files: string[] = []): AuthContext {
 	return {
@@ -307,7 +317,7 @@ describe("createProvider", () => {
 		return { stream: respond, streamSimple: respond };
 	}
 
-	function testModel(api: string, id: string): Model<Api> {
+	function testModel<TApi extends Api>(api: TApi, id: string): Model<TApi> {
 		return {
 			id,
 			name: id,
@@ -320,6 +330,41 @@ describe("createProvider", () => {
 			contextWindow: 10000,
 			maxTokens: 1000,
 		};
+	}
+
+	/** 创建供原生压缩 Provider 契约测试使用的精确 API 模型。 */
+	function testNativeModel<TApi extends NativeCompactionApi>(api: TApi, id: string): Model<TApi> {
+		return testModel(api, id);
+	}
+
+	/** 创建完整原生压缩三件套；网络能力在本 Atom 中保持不可执行。 */
+	function nativeStreams<TApi extends NativeCompactionApi>(
+		resolveNativeCompactionEndpoint: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionEndpoint"],
+	) {
+		return {
+			...recordingStreams("native", []),
+			compact: async () => {
+				throw createNativeCompactionError("provider_error");
+			},
+			canConsumeProviderContext: async () => false,
+			resolveNativeCompactionEndpoint,
+		};
+	}
+
+	/** 捕获并断言 Provider Native 调用必须抛出的固定安全错误。 */
+	function captureProviderNativeError(
+		callback: () => unknown,
+		code: NativeCompactionError["code"],
+	): NativeCompactionError {
+		let thrown: unknown;
+		try {
+			callback();
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(NativeCompactionError);
+		expect((thrown as NativeCompactionError).code).toBe(code);
+		return thrown as NativeCompactionError;
 	}
 
 	it("dispatches on model.api for mixed-API providers", async () => {
@@ -386,7 +431,9 @@ describe("createProvider", () => {
 			models: [testModel("api-a", "model-a")],
 			api: { "api-a": recordingStreams("a", []) },
 		});
-		const result = await provider.streamSimple(testModel("api-ghost", "model-x"), context).result();
+		const result = await provider
+			.streamSimple(testModel("api-ghost", "model-x") as unknown as Model<"api-a">, context)
+			.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("no API implementation");
 	});
@@ -423,6 +470,286 @@ describe("createProvider", () => {
 		// a later refresh fetches again
 		await provider.refreshModels?.(refreshContext);
 		expect(fetches).toBe(2);
+	});
+
+	it("按 API 暴露完整原生压缩三件套，并复制冻结公开 Options", () => {
+		const model = testNativeModel("openai-responses", "gpt-test");
+		let capturedOptions: Readonly<NativeCompactionPublicOptionsMap["openai-responses"]> | undefined;
+		const provider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">((_model, options) => {
+				capturedOptions = options;
+				return { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" };
+			}),
+		});
+		const controller = new AbortController();
+		const fetchHandle: typeof fetch = async () => new Response();
+		const onPayload = (payload: unknown) => payload;
+		const onResponse = () => undefined;
+		const headers = { Authorization: "Bearer test", Suppressed: null };
+		const env = { TEST_ENV: "value" };
+		const options = {
+			signal: controller.signal,
+			fetch: fetchHandle,
+			onPayload,
+			onResponse,
+			headers,
+			env,
+			apiKey: "test-key",
+			sessionId: "session",
+			cacheRetention: "long" as const,
+			timeoutMs: 1.5,
+			maxRetries: 2,
+			maxRetryDelayMs: 25.5,
+			reasoningEffort: "high" as const,
+			reasoningSummary: "concise" as const,
+			serviceTier: "priority" as const,
+		};
+
+		expect(provider.compact).toBeTypeOf("function");
+		expect(provider.canConsumeProviderContext).toBeTypeOf("function");
+		expect(provider.resolveNativeCompactionEndpoint?.(model, options)).toEqual({
+			endpoint: "https://api.openai.test/v1",
+			protocol: "openai-responses-compact",
+		});
+		expect(capturedOptions).not.toBe(options);
+		expect(Object.isFrozen(capturedOptions)).toBe(true);
+		expect(Object.isFrozen(capturedOptions?.headers)).toBe(true);
+		expect(Object.isFrozen(capturedOptions?.env)).toBe(true);
+		expect(capturedOptions?.signal).toBe(controller.signal);
+		expect(capturedOptions?.fetch).toBe(fetchHandle);
+		expect(capturedOptions?.onPayload).toBe(onPayload);
+		expect(capturedOptions?.onResponse).toBe(onResponse);
+		headers.Authorization = "changed";
+		env.TEST_ENV = "changed";
+		expect(capturedOptions?.headers?.Authorization).toBe("Bearer test");
+		expect(capturedOptions?.env?.TEST_ENV).toBe("value");
+		expect(Object.isFrozen(controller.signal)).toBe(false);
+	});
+
+	it("让 Codex 使用独立 Options 值域，不向 OpenAI Public 借用", () => {
+		const model = testNativeModel("openai-codex-responses", "codex-test");
+		let capturedOptions: Readonly<NativeCompactionPublicOptionsMap["openai-codex-responses"]> | undefined;
+		const provider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-codex-responses">((_model, options) => {
+				capturedOptions = options;
+				return { endpoint: "https://chatgpt.test/backend-api/codex", protocol: "openai-codex-remote-v2" };
+			}),
+		});
+
+		provider.resolveNativeCompactionEndpoint?.(model, {
+			reasoningEffort: "none",
+			reasoningSummary: "off",
+			textVerbosity: "high",
+		});
+		expect(capturedOptions).toMatchObject({
+			reasoningEffort: "none",
+			reasoningSummary: "off",
+			textVerbosity: "high",
+		});
+	});
+
+	it.each([
+		["openai-responses", { reasoningEffort: "none" }],
+		["openai-responses", { textVerbosity: "low" }],
+		["openai-responses", { toolChoice: "auto" }],
+		["openai-codex-responses", { toolChoice: "auto" }],
+		["openai-codex-responses", { azureResourceName: "resource" }],
+		["openai-codex-responses", { unknownField: true }],
+		["openai-codex-responses", { binding: {} }],
+		["openai-codex-responses", { credentialScopeHash: "secret" }],
+		["openai-codex-responses", { providerContext: {} }],
+		["openai-codex-responses", { requestId: "request" }],
+		["openai-responses", { signal: {} }],
+		["openai-responses", { maxRetries: 1.5 }],
+		["openai-responses", JSON.parse('{"headers":{"__proto__":"unsafe"}}')],
+	] as const)("拒绝 %s 的越界公开 Options", (api, unsafeOptions) => {
+		const model = testNativeModel(api, "test");
+		const provider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<typeof api>((_model) => ({
+				endpoint: "https://example.test/native",
+				protocol: api === "openai-responses" ? "openai-responses-compact" : "openai-codex-remote-v2",
+			})),
+		});
+
+		expect(() =>
+			provider.resolveNativeCompactionEndpoint?.(
+				model,
+				unsafeOptions as unknown as NativeCompactionPublicOptionsMap[typeof api],
+			),
+		).toThrowError(NativeCompactionError);
+		try {
+			provider.resolveNativeCompactionEndpoint?.(
+				model,
+				unsafeOptions as unknown as NativeCompactionPublicOptionsMap[typeof api],
+			);
+		} catch (error) {
+			expect((error as NativeCompactionError).code).toBe("invalid_context");
+		}
+	});
+
+	it("By-API Provider 对 Custom API 和不完整 Capability 返回 Unsupported", () => {
+		const nativeModel = testNativeModel("openai-responses", "native");
+		const customModel = testModel("custom-api", "custom");
+		const partialStreams = {
+			...recordingStreams("partial", []),
+			compact: async () => {
+				throw createNativeCompactionError("provider_error");
+			},
+		} as unknown as ProviderStreams<"openai-responses">;
+		const partialProvider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [nativeModel],
+			api: partialStreams,
+		});
+		expect(() => partialProvider.resolveNativeCompactionEndpoint?.(nativeModel, {})).toThrowError(
+			NativeCompactionError,
+		);
+		try {
+			partialProvider.resolveNativeCompactionEndpoint?.(nativeModel, {});
+		} catch (error) {
+			expect((error as NativeCompactionError).code).toBe("unsupported");
+		}
+
+		const mixedProvider = createProvider<"openai-responses" | "custom-api">({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [nativeModel, customModel],
+			api: {
+				"openai-responses": nativeStreams<"openai-responses">(() => ({
+					endpoint: "https://example.test/native",
+					protocol: "openai-responses-compact",
+				})),
+				"custom-api": recordingStreams("custom", []),
+			},
+		});
+		expect(() =>
+			mixedProvider.resolveNativeCompactionEndpoint?.(customModel as unknown as Model<"openai-responses">, {}),
+		).toThrowError(NativeCompactionError);
+	});
+
+	it("净化 Endpoint Resolver 的原始异常和非法返回", () => {
+		const model = testNativeModel("openai-responses", "gpt-test");
+		const failingProvider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">(() => {
+				throw new Error("sensitive-provider-error");
+			}),
+		});
+		const crossProtocolProvider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">(
+				() =>
+					({
+						endpoint: "https://example.test/native",
+						protocol: "openai-codex-remote-v2",
+					}) as never,
+			),
+		});
+		const codexModel = testNativeModel("openai-codex-responses", "codex-test");
+		const reverseCrossProtocolProvider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [codexModel],
+			api: nativeStreams<"openai-codex-responses">(
+				() =>
+					({
+						endpoint: "https://example.test/native",
+						protocol: "openai-responses-compact",
+					}) as never,
+			),
+		});
+		const invalidObjectProvider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">(() => new Date() as never),
+		});
+
+		const providerError = captureProviderNativeError(
+			() => failingProvider.resolveNativeCompactionEndpoint?.(model, {}),
+			"provider_error",
+		);
+		expect(String(providerError)).not.toContain("sensitive-provider-error");
+		for (const [provider, endpointModel] of [
+			[crossProtocolProvider, model],
+			[reverseCrossProtocolProvider, codexModel],
+			[invalidObjectProvider, model],
+		] as const) {
+			captureProviderNativeError(
+				() => provider.resolveNativeCompactionEndpoint?.(endpointModel as never, {}),
+				"protocol",
+			);
+		}
+	});
+
+	it("拒绝 Provider 直接传入未由 Models 登记的同形请求", async () => {
+		const model = testNativeModel("openai-responses", "gpt-test");
+		const provider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">(() => ({
+				endpoint: "https://example.test/native",
+				protocol: "openai-responses-compact",
+			})),
+		});
+		const forgedRequest = {
+			model,
+			context: { messages: [] },
+			options: {},
+			binding: {},
+			providerContext: undefined,
+		} as unknown as NativeCompactionProviderRequest<"openai-responses">;
+
+		expect(() => assertNativeCompactionProviderRequest(forgedRequest)).toThrowError(NativeCompactionError);
+		await expect(provider.compact?.(forgedRequest)).rejects.toMatchObject({ code: "unsupported" });
+		await expect(provider.canConsumeProviderContext?.(forgedRequest)).rejects.toMatchObject({ code: "unsupported" });
+	});
+
+	it("在类型层保持两个 Options 和请求字段闭合", () => {
+		type PublicKeys = keyof NativeCompactionPublicOptionsMap["openai-responses"];
+		type CodexKeys = keyof NativeCompactionPublicOptionsMap["openai-codex-responses"];
+		type RequestKeys = keyof NativeCompactionProviderRequest<"openai-responses">;
+
+		expectTypeOf<Extract<"textVerbosity", PublicKeys>>().toEqualTypeOf<never>();
+		expectTypeOf<Extract<"textVerbosity", CodexKeys>>().toEqualTypeOf<"textVerbosity">();
+		expectTypeOf<Extract<"toolChoice", PublicKeys | CodexKeys>>().toEqualTypeOf<never>();
+		expectTypeOf<Extract<"providerContext", RequestKeys>>().toEqualTypeOf<"providerContext">();
+		expectTypeOf<Extract<"api" | "requestId", RequestKeys>>().toEqualTypeOf<never>();
+
+		const compileProviderTypeContract = () => {
+			const typedProvider = {} as Provider<"openai-responses">;
+			// @ts-expect-error Provider Capability 必须保持只读。
+			typedProvider.compact = undefined;
+			const partialCapability = {
+				...recordingStreams("partial-type", []),
+				compact: async () => {
+					throw createNativeCompactionError("provider_error");
+				},
+			};
+			// @ts-expect-error ProviderStreams 不允许只实现原生压缩三件套的一部分。
+			const invalidStreams: ProviderStreams<"openai-responses"> = partialCapability;
+			void invalidStreams;
+			const erasedProvider = {} as Provider;
+			const request = {} as NativeCompactionProviderRequest<"openai-responses">;
+			// @ts-expect-error 异构集合中的擦除 Capability 不接受实际 Request。
+			erasedProvider.compact?.(request);
+		};
+		void compileProviderTypeContract;
 	});
 });
 

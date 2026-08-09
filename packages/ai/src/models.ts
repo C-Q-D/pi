@@ -22,12 +22,22 @@ import type {
 	Model,
 	ModelCostRates,
 	ModelThinkingLevel,
+	NativeCompactionApi,
+	NativeCompactionEndpoint,
+	NativeCompactionProviderCapabilities,
+	NativeCompactionProviderRequest,
+	NativeCompactionPublicOptionsMap,
+	NativeCompactionResult,
+	NoNativeCompactionProviderCapabilities,
+	OptionalNativeCompactionProviderCapabilities,
 	ProviderHeaders,
+	ProviderStreamMethods,
 	ProviderStreams,
 	SimpleStreamOptions,
 	StreamOptions,
 	Usage,
 } from "./types.ts";
+import { createNativeCompactionError, sanitizeNativeCompactionError } from "./utils/native-compaction.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -70,9 +80,9 @@ export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamTransf
  * `TApi` lets concrete provider factories declare which APIs their models
  * use (e.g. `openaiProvider(): Provider<"openai-responses" | "openai-completions">`),
  * giving typed model lists to direct factory users. Inside a `Models`
- * collection providers are held as `Provider<Api>`.
+ * collection providers are held in the erased default `Provider` shape.
  */
-export interface Provider<TApi extends Api = Api> {
+interface ProviderCore<TApi extends Api = Api> {
 	readonly id: string;
 	readonly name: string;
 
@@ -118,6 +128,22 @@ export interface Provider<TApi extends Api = Api> {
 
 	streamSimple(model: Model<TApi>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
 }
+
+/** Provider 集合保存异构 API 时使用的只读、不可调用擦除形状。 */
+interface ErasedNativeCompactionProviderCapabilities {
+	readonly compact: (request: never) => Promise<NativeCompactionResult>;
+	readonly canConsumeProviderContext: (request: never) => Promise<boolean>;
+	readonly resolveNativeCompactionEndpoint: (model: never, options: never) => NativeCompactionEndpoint;
+}
+
+type OptionalErasedNativeCompactionProviderCapabilities =
+	| ErasedNativeCompactionProviderCapabilities
+	| NoNativeCompactionProviderCapabilities;
+
+/** Provider 普通能力与可选、不可拆分的原生压缩三件套。 */
+export type Provider<TApi extends Api = never> = [TApi] extends [never]
+	? ProviderCore<Api> & OptionalErasedNativeCompactionProviderCapabilities
+	: ProviderCore<TApi> & OptionalNativeCompactionProviderCapabilities<TApi>;
 
 /**
  * Runtime collection of providers plus auth application and stream
@@ -213,6 +239,244 @@ function mergeHeaders(
 		merged[name] = value;
 	}
 	return merged;
+}
+
+const NATIVE_COMPACTION_APIS = new Set<NativeCompactionApi>(["openai-responses", "openai-codex-responses"]);
+const NATIVE_COMPACTION_COMMON_OPTION_KEYS = [
+	"signal",
+	"apiKey",
+	"fetch",
+	"headers",
+	"timeoutMs",
+	"maxRetries",
+	"maxRetryDelayMs",
+	"env",
+	"onPayload",
+	"onResponse",
+	"sessionId",
+	"cacheRetention",
+	"reasoningEffort",
+	"reasoningSummary",
+	"serviceTier",
+] as const;
+const OPENAI_RESPONSES_NATIVE_OPTION_KEYS = new Set<string>(NATIVE_COMPACTION_COMMON_OPTION_KEYS);
+const OPENAI_CODEX_NATIVE_OPTION_KEYS = new Set<string>([...NATIVE_COMPACTION_COMMON_OPTION_KEYS, "textVerbosity"]);
+const NATIVE_COMPACTION_PROVIDER_REQUESTS = new WeakSet<object>();
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+/** createProvider 内部用于运行时检查三件套的宽形状，不向调用方开放部分 Capability。 */
+type ProviderStreamsRuntime = ProviderStreamMethods & Partial<NativeCompactionProviderCapabilities>;
+
+/** 只读取普通对象上的可枚举字符串数据属性，避免执行 Getter。 */
+function readNativeCompactionObject(value: unknown): ReadonlyMap<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw createNativeCompactionError("invalid_context");
+	}
+	if (Object.getPrototypeOf(value) !== Object.prototype) {
+		throw createNativeCompactionError("invalid_context");
+	}
+	const properties = new Map<string, unknown>();
+	for (const key of Reflect.ownKeys(value)) {
+		if (typeof key !== "string" || DANGEROUS_KEYS.has(key)) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		properties.set(key, descriptor.value);
+	}
+	return properties;
+}
+
+/** 复制并冻结 Headers/Env 这类闭合字符串记录。 */
+function cloneNativeCompactionRecord(value: unknown, allowNull: boolean): Readonly<Record<string, string | null>> {
+	const properties = readNativeCompactionObject(value);
+	const clone: Record<string, string | null> = {};
+	for (const [key, entry] of properties) {
+		if (typeof entry !== "string" && !(allowNull && entry === null)) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		clone[key] = entry;
+	}
+	return Object.freeze(clone);
+}
+
+/** 按 API 校验、复制并冻结原生压缩公开选项。 */
+function validateNativeCompactionOptions<TApi extends NativeCompactionApi>(
+	api: TApi,
+	options: unknown,
+): Readonly<NativeCompactionPublicOptionsMap[TApi]> {
+	try {
+		const properties = readNativeCompactionObject(options);
+		const allowed =
+			api === "openai-responses" ? OPENAI_RESPONSES_NATIVE_OPTION_KEYS : OPENAI_CODEX_NATIVE_OPTION_KEYS;
+		const clone: Record<string, unknown> = {};
+		for (const [key, value] of properties) {
+			if (!allowed.has(key)) {
+				throw createNativeCompactionError("invalid_context");
+			}
+			switch (key) {
+				case "signal":
+					if (!(value instanceof AbortSignal)) throw createNativeCompactionError("invalid_context");
+					clone.signal = value;
+					break;
+				case "apiKey":
+				case "sessionId":
+					if (typeof value !== "string" || value.length === 0) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone[key] = value;
+					break;
+				case "fetch":
+				case "onPayload":
+				case "onResponse":
+					if (typeof value !== "function") throw createNativeCompactionError("invalid_context");
+					clone[key] = value;
+					break;
+				case "headers":
+					clone.headers = cloneNativeCompactionRecord(value, true);
+					break;
+				case "env":
+					clone.env = cloneNativeCompactionRecord(value, false);
+					break;
+				case "timeoutMs":
+				case "maxRetryDelayMs":
+					if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone[key] = value;
+					break;
+				case "maxRetries":
+					if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.maxRetries = value;
+					break;
+				case "cacheRetention":
+					if (value !== "none" && value !== "short" && value !== "long") {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.cacheRetention = value;
+					break;
+				case "reasoningEffort": {
+					const commonEffort =
+						value === "minimal" ||
+						value === "low" ||
+						value === "medium" ||
+						value === "high" ||
+						value === "xhigh" ||
+						value === "max";
+					if (!commonEffort && !(api === "openai-codex-responses" && value === "none")) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.reasoningEffort = value;
+					break;
+				}
+				case "reasoningSummary": {
+					const commonSummary = value === "auto" || value === "detailed" || value === "concise" || value === null;
+					if (!commonSummary && !(api === "openai-codex-responses" && (value === "off" || value === "on"))) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.reasoningSummary = value;
+					break;
+				}
+				case "serviceTier":
+					if (
+						value !== "auto" &&
+						value !== "default" &&
+						value !== "flex" &&
+						value !== "scale" &&
+						value !== "priority" &&
+						value !== null
+					) {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.serviceTier = value;
+					break;
+				case "textVerbosity":
+					if (value !== "low" && value !== "medium" && value !== "high") {
+						throw createNativeCompactionError("invalid_context");
+					}
+					clone.textVerbosity = value;
+					break;
+			}
+		}
+		return Object.freeze(clone) as Readonly<NativeCompactionPublicOptionsMap[TApi]>;
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "invalid_context");
+	}
+}
+
+/** 判断 API 是否属于首版原生压缩白名单。 */
+function isNativeCompactionApi(api: Api): api is NativeCompactionApi {
+	return NATIVE_COMPACTION_APIS.has(api as NativeCompactionApi);
+}
+
+/** 判断一个 Stream 实现是否完整提供原生压缩三件套。 */
+function hasNativeCompactionCapabilities(
+	streams: ProviderStreamsRuntime,
+): streams is ProviderStreamMethods & NativeCompactionProviderCapabilities {
+	return (
+		typeof streams.compact === "function" &&
+		typeof streams.canConsumeProviderContext === "function" &&
+		typeof streams.resolveNativeCompactionEndpoint === "function"
+	);
+}
+
+/** 判断一个 Stream 实现是否声明了任意原生压缩成员。 */
+function hasAnyNativeCompactionCapability(streams: ProviderStreamsRuntime): boolean {
+	return (
+		typeof streams.compact === "function" ||
+		typeof streams.canConsumeProviderContext === "function" ||
+		typeof streams.resolveNativeCompactionEndpoint === "function"
+	);
+}
+
+/**
+ * 断言请求已由 Models Preflight 登记。
+ *
+ * 该函数只开放检查能力，不开放 WeakSet 登记能力；公开 raw Adapter 的 Native
+ * 方法必须在读取请求或发网前调用它。
+ */
+export function assertNativeCompactionProviderRequest(request: NativeCompactionProviderRequest): void {
+	if (!NATIVE_COMPACTION_PROVIDER_REQUESTS.has(request)) {
+		throw createNativeCompactionError("unsupported");
+	}
+}
+
+/** 校验并冻结 Adapter 返回的 Endpoint Identity。 */
+function validateNativeCompactionEndpoint<TApi extends NativeCompactionApi>(
+	api: TApi,
+	value: unknown,
+): NativeCompactionEndpoint<TApi> {
+	try {
+		const properties = readNativeCompactionObject(value);
+		if (properties.size !== 2 || !properties.has("endpoint") || !properties.has("protocol")) {
+			throw createNativeCompactionError("protocol");
+		}
+		const endpoint = properties.get("endpoint");
+		const protocol = properties.get("protocol");
+		const protocolMatchesApi =
+			api === "openai-responses"
+				? protocol === "openai-responses-compact"
+				: protocol === "openai-codex-remote-v2" || protocol === "openai-codex-compact-legacy";
+		if (
+			typeof endpoint !== "string" ||
+			endpoint.length === 0 ||
+			CONTROL_CHARACTER_PATTERN.test(endpoint) ||
+			!protocolMatchesApi
+		) {
+			throw createNativeCompactionError("protocol");
+		}
+		return Object.freeze({
+			endpoint,
+			protocol: protocol as NativeCompactionEndpoint<TApi>["protocol"],
+		});
+	} catch {
+		throw createNativeCompactionError("protocol");
+	}
 }
 
 class ModelsImpl implements MutableModels {
@@ -544,7 +808,7 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	fetchModels?: (context: RefreshModelsContext) => Promise<readonly Model<TApi>[]>;
 	filterModels?: (models: readonly Model<TApi>[], credential: Credential | undefined) => readonly Model<TApi>[];
 	/** Single implementation, or map keyed by `model.api` for mixed-API providers. */
-	api: ProviderStreams | Partial<Record<TApi, ProviderStreams>>;
+	api: ProviderStreams<TApi> | Partial<{ [TCurrentApi in TApi]: ProviderStreams<TCurrentApi> }>;
 }
 
 /**
@@ -568,14 +832,18 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		return merged;
 	};
 	const single =
-		typeof (input.api as ProviderStreams).stream === "function" ? (input.api as ProviderStreams) : undefined;
-	const byApi = single ? undefined : (input.api as Partial<Record<string, ProviderStreams>>);
+		typeof (input.api as ProviderStreamMethods).stream === "function"
+			? (input.api as ProviderStreamsRuntime)
+			: undefined;
+	const byApi = single ? undefined : (input.api as Partial<Record<string, ProviderStreamsRuntime>>);
 
-	const apiFor = (model: Model<Api>): ProviderStreams | undefined => single ?? byApi?.[model.api];
+	const apiFor = (model: Model<Api>): ProviderStreamsRuntime | undefined => single ?? byApi?.[model.api];
+	const configuredStreams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);
+	const exposesNativeCompaction = configuredStreams.some(hasAnyNativeCompactionCapability);
 
 	const dispatch = (
 		model: Model<Api>,
-		run: (streams: ProviderStreams) => AssistantMessageEventStream,
+		run: (streams: ProviderStreamsRuntime) => AssistantMessageEventStream,
 	): AssistantMessageEventStream => {
 		const streams = apiFor(model);
 		if (!streams) {
@@ -586,7 +854,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		return run(streams);
 	};
 
-	return {
+	const providerCore: ProviderCore<TApi> = {
 		id: input.id,
 		name: input.name ?? input.id,
 		baseUrl: input.baseUrl,
@@ -620,6 +888,55 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		streamSimple: (model, context, options) =>
 			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
 	};
+	if (!exposesNativeCompaction) {
+		return providerCore as Provider<TApi>;
+	}
+
+	const nativeCapabilities: NativeCompactionProviderCapabilities = {
+		compact: async (request): Promise<NativeCompactionResult> => {
+			assertNativeCompactionProviderRequest(request);
+			const streams = apiFor(request.model);
+			if (!streams || !hasNativeCompactionCapabilities(streams)) {
+				throw createNativeCompactionError("unsupported");
+			}
+			try {
+				return await streams.compact(request);
+			} catch (error) {
+				throw sanitizeNativeCompactionError(error, "provider_error");
+			}
+		},
+		canConsumeProviderContext: async (request): Promise<boolean> => {
+			assertNativeCompactionProviderRequest(request);
+			const streams = apiFor(request.model);
+			if (!streams || !hasNativeCompactionCapabilities(streams)) {
+				throw createNativeCompactionError("unsupported");
+			}
+			try {
+				return await streams.canConsumeProviderContext(request);
+			} catch (error) {
+				throw sanitizeNativeCompactionError(error, "provider_error");
+			}
+		},
+		resolveNativeCompactionEndpoint: (model, options): NativeCompactionEndpoint => {
+			try {
+				if (!isNativeCompactionApi(model.api)) {
+					throw createNativeCompactionError("unsupported");
+				}
+				const streams = apiFor(model);
+				if (!streams || !hasNativeCompactionCapabilities(streams)) {
+					throw createNativeCompactionError("unsupported");
+				}
+				const validatedOptions = validateNativeCompactionOptions(model.api, options);
+				return validateNativeCompactionEndpoint(
+					model.api,
+					streams.resolveNativeCompactionEndpoint(model, validatedOptions),
+				);
+			} catch (error) {
+				throw sanitizeNativeCompactionError(error, "provider_error");
+			}
+		},
+	};
+	return Object.assign(providerCore, nativeCapabilities) as Provider<TApi>;
 }
 
 /**
