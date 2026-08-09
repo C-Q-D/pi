@@ -21,13 +21,20 @@ function loadNodeOs(): typeof NodeOs | null {
 // NEVER convert to top-level runtime imports - breaks browser/Vite builds
 const _os: typeof NodeOs | null = loadNodeOs();
 
-import { clampThinkingLevel } from "../models.ts";
+import { parseOpenAICodexAccountId } from "../auth/oauth/openai-codex-jwt.ts";
+import { assertNativeCompactionProviderRequest, clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
 	Api,
 	AssistantMessage,
 	Context,
+	JsonObject,
+	JsonValue,
 	Model,
+	NativeCompactionProviderRequest,
+	NativeCompactionResult,
+	NativeCompactionUsage,
+	ProviderContextEnvelope,
 	ProviderEnv,
 	ProviderHeaders,
 	SimpleStreamOptions,
@@ -45,9 +52,20 @@ import {
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import {
+	cloneAndFreezeJson,
+	createNativeCompactionError,
+	sanitizeNativeCompactionError,
+	validateNativeCompactionResult,
+} from "../utils/native-compaction.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
+import {
+	resolveOpenAICodexCompactionEndpoint,
+	resolveOpenAICodexResponsesUrl,
+} from "./openai-codex-responses-shared.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -56,8 +74,6 @@ import { buildBaseOptions } from "./simple-options.ts";
 // Configuration
 // ============================================================================
 
-const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const DEFAULT_MAX_RETRIES = 0;
 const BASE_DELAY_MS = 1000;
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
@@ -69,6 +85,43 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+const CODEX_REMOTE_COMPACTION_V2_FEATURE = "remote_compaction_v2";
+const CODEX_REMOTE_COMPACTION_MAX_RETRIES = 2;
+const CODEX_REMOTE_COMPACTION_RETAINED_TOKENS = 64_000;
+const CODEX_REMOTE_COMPACTION_PAYLOAD_KEYS = new Set([
+	"model",
+	"store",
+	"stream",
+	"instructions",
+	"input",
+	"tools",
+	"tool_choice",
+	"parallel_tool_calls",
+	"temperature",
+	"reasoning",
+	"service_tier",
+	"text",
+	"include",
+	"prompt_cache_key",
+]);
+const CODEX_REMOTE_COMPACTION_RETRYABLE_CODES = new Set([
+	"server_error",
+	"internal_server_error",
+	"rate_limit_exceeded",
+]);
+const CODEX_REMOTE_COMPACTION_CAPACITY_CODES = new Set(["context_length_exceeded"]);
+const CODEX_REMOTE_COMPACTION_TERMINAL_CODES = new Set([
+	"insufficient_quota",
+	"usage_not_included",
+	"invalid_prompt",
+	"bio_policy",
+	"cyber_policy",
+	"server_is_overloaded",
+	"slow_down",
+]);
+const CODEX_REMOTE_COMPACTION_SERVICE_TIERS = new Set(["auto", "default", "flex", "scale", "priority"]);
+const CODEX_REMOTE_COMPACTION_DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const AUTHORIZED_CODEX_REPLAY_CONTEXTS = new WeakSet<object>();
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -110,6 +163,283 @@ interface RequestBody {
 	include?: string[];
 	prompt_cache_key?: string;
 	[key: string]: unknown;
+}
+
+type NativeCodexRequestBody = Readonly<RequestBody> & { readonly input: readonly JsonValue[] };
+
+interface CodexCompactionAttemptResult {
+	readonly item: JsonObject;
+	readonly usage?: NativeCompactionUsage;
+}
+
+const CODEX_COMPACTION_RETRY_ERRORS = new WeakSet<object>();
+
+/** 只向共享退避器传递延迟信息，避免响应头改写 Codex 固定重试分类。 */
+function selectCodexCompactionRetryHeaders(headers: Headers | undefined): Headers | undefined {
+	if (!headers) return undefined;
+	const selected = new Headers();
+	for (const key of ["retry-after", "retry-after-ms"]) {
+		const value = headers.get(key);
+		if (value !== null) selected.set(key, value);
+	}
+	return selected;
+}
+
+/** 只携带固定文本、供共享重试器识别的内部瞬态失败。 */
+class CodexCompactionRetryError extends Error {
+	readonly status: number | undefined;
+	readonly headers: Headers | undefined;
+
+	constructor(status?: number, headers?: Headers) {
+		super("Codex remote compaction retryable failure");
+		this.name = "CodexCompactionRetryError";
+		this.status = status;
+		this.headers = selectCodexCompactionRetryHeaders(headers);
+		CODEX_COMPACTION_RETRY_ERRORS.add(this);
+	}
+}
+
+/** Native 路径的 Abort 必须优先于 Provider 或 Protocol 错误。 */
+function throwIfNativeCompactionAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
+}
+
+/** 递归复制 Codex Wire JSON；与公共 Provider Context 不同，这里允许受控 Trigger。 */
+function cloneCodexWireJsonValue(value: unknown, active: WeakSet<object>): JsonValue {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw createNativeCompactionError("protocol");
+		return value;
+	}
+	if (typeof value !== "object" || active.has(value)) throw createNativeCompactionError("protocol");
+	active.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (Object.getPrototypeOf(value) !== Array.prototype) throw createNativeCompactionError("protocol");
+			const keys = Reflect.ownKeys(value);
+			for (const key of keys) {
+				if (key === "length") continue;
+				if (typeof key !== "string" || !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length) {
+					throw createNativeCompactionError("protocol");
+				}
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (!descriptor?.enumerable || !("value" in descriptor)) throw createNativeCompactionError("protocol");
+			}
+			const clone: JsonValue[] = [];
+			for (let index = 0; index < value.length; index += 1) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+				if (!descriptor || !("value" in descriptor)) throw createNativeCompactionError("protocol");
+				clone.push(cloneCodexWireJsonValue(descriptor.value, active));
+			}
+			return Object.freeze(clone);
+		}
+		if (Object.getPrototypeOf(value) !== Object.prototype) throw createNativeCompactionError("protocol");
+		const clone: Record<string, JsonValue> = {};
+		for (const key of Reflect.ownKeys(value)) {
+			if (typeof key !== "string" || CODEX_REMOTE_COMPACTION_DANGEROUS_KEYS.has(key)) {
+				throw createNativeCompactionError("protocol");
+			}
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor?.enumerable || !("value" in descriptor)) throw createNativeCompactionError("protocol");
+			clone[key] = cloneCodexWireJsonValue(descriptor.value, active);
+		}
+		return Object.freeze(clone) as JsonObject;
+	} finally {
+		active.delete(value);
+	}
+}
+
+/** 把未知 Callback 或 SSE 数据净化为冻结的 Plain JSON。 */
+function cloneCodexWireJson(value: unknown): JsonValue {
+	try {
+		return cloneCodexWireJsonValue(value, new WeakSet());
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "protocol");
+	}
+}
+
+function isJsonObject(value: JsonValue): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
+	if (left === right) return true;
+	if (Array.isArray(left) || Array.isArray(right)) {
+		if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+		return left.every((value, index) => jsonValuesEqual(value, right[index]));
+	}
+	if (!isJsonObject(left) || !isJsonObject(right)) return false;
+	const leftKeys = Object.keys(left).sort();
+	const rightKeys = Object.keys(right).sort();
+	if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) return false;
+	return leftKeys.every((key) => jsonValuesEqual(left[key], right[key]));
+}
+
+function containsCompactionTrigger(value: JsonValue): boolean {
+	if (Array.isArray(value)) return value.some(containsCompactionTrigger);
+	if (!isJsonObject(value)) return false;
+	if (value.type === "compaction_trigger") return true;
+	return Object.values(value).some(containsCompactionTrigger);
+}
+
+function assertCanonicalPrefix(input: readonly JsonValue[], prefix: readonly JsonValue[]): void {
+	if (input.length < prefix.length) throw createNativeCompactionError("protocol");
+	for (let index = 0; index < prefix.length; index += 1) {
+		if (!jsonValuesEqual(input[index], prefix[index])) throw createNativeCompactionError("protocol");
+	}
+}
+
+function validateOptionalString(value: JsonValue | undefined): value is string | undefined {
+	return value === undefined || typeof value === "string";
+}
+
+/** 校验 Callback 后的 V2/Replay Wire Body，并锁定 Canonical Prefix 与 Trigger。 */
+function validateNativeCodexPayload(
+	value: unknown,
+	modelId: string,
+	prefix: readonly JsonValue[],
+	requireTrigger: boolean,
+): NativeCodexRequestBody {
+	const cloned = cloneCodexWireJson(value);
+	if (!isJsonObject(cloned) || Object.keys(cloned).some((key) => !CODEX_REMOTE_COMPACTION_PAYLOAD_KEYS.has(key))) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (cloned.model !== modelId || cloned.store !== false || cloned.stream !== true || !Array.isArray(cloned.input)) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (!validateOptionalString(cloned.instructions) || !validateOptionalString(cloned.prompt_cache_key)) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (
+		cloned.tools !== undefined &&
+		(!Array.isArray(cloned.tools) || cloned.tools.some((tool) => !isJsonObject(tool)))
+	) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (
+		cloned.include !== undefined &&
+		(!Array.isArray(cloned.include) || cloned.include.some((item) => typeof item !== "string"))
+	) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (
+		cloned.tool_choice !== undefined &&
+		cloned.tool_choice !== "auto" &&
+		cloned.tool_choice !== "none" &&
+		cloned.tool_choice !== "required"
+	) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (cloned.parallel_tool_calls !== undefined && typeof cloned.parallel_tool_calls !== "boolean") {
+		throw createNativeCompactionError("protocol");
+	}
+	if (
+		cloned.temperature !== undefined &&
+		(typeof cloned.temperature !== "number" || !Number.isFinite(cloned.temperature))
+	) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (cloned.reasoning !== undefined) {
+		if (
+			!isJsonObject(cloned.reasoning) ||
+			Object.keys(cloned.reasoning).some((key) => key !== "effort" && key !== "summary")
+		) {
+			throw createNativeCompactionError("protocol");
+		}
+		if (!validateOptionalString(cloned.reasoning.effort) || !validateOptionalString(cloned.reasoning.summary)) {
+			throw createNativeCompactionError("protocol");
+		}
+	}
+	if (
+		cloned.service_tier !== undefined &&
+		cloned.service_tier !== null &&
+		(typeof cloned.service_tier !== "string" || !CODEX_REMOTE_COMPACTION_SERVICE_TIERS.has(cloned.service_tier))
+	) {
+		throw createNativeCompactionError("protocol");
+	}
+	if (cloned.text !== undefined) {
+		if (!isJsonObject(cloned.text) || Object.keys(cloned.text).some((key) => key !== "verbosity")) {
+			throw createNativeCompactionError("protocol");
+		}
+		if (cloned.text.verbosity !== "low" && cloned.text.verbosity !== "medium" && cloned.text.verbosity !== "high") {
+			throw createNativeCompactionError("protocol");
+		}
+	}
+	assertCanonicalPrefix(cloned.input, prefix);
+	let triggerCount = 0;
+	for (const [index, item] of cloned.input.entries()) {
+		if (isJsonObject(item) && item.type === "compaction_trigger") {
+			triggerCount += 1;
+			if (Object.keys(item).length !== 1 || index !== cloned.input.length - 1) {
+				throw createNativeCompactionError("protocol");
+			}
+		} else if (containsCompactionTrigger(item)) {
+			throw createNativeCompactionError("protocol");
+		}
+	}
+	if ((requireTrigger && triggerCount !== 1) || (!requireTrigger && triggerCount !== 0)) {
+		throw createNativeCompactionError("protocol");
+	}
+	return cloned as unknown as NativeCodexRequestBody;
+}
+
+/** Trusted Adapter Body 先按 JSON Wire 语义投影，去掉 TypeBox 内部 Descriptor。 */
+function projectNativeCodexPayload(
+	value: RequestBody,
+	modelId: string,
+	prefix: readonly JsonValue[],
+	requireTrigger: boolean,
+): NativeCodexRequestBody {
+	try {
+		return validateNativeCodexPayload(JSON.parse(JSON.stringify(value)), modelId, prefix, requireTrigger);
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "protocol");
+	}
+}
+
+/** Canonical Codex Context 必须是 User Messages 后跟唯一 Compaction Item。 */
+function validateCodexCanonicalItems(value: unknown): readonly JsonValue[] {
+	let cloned: JsonValue;
+	try {
+		cloned = cloneAndFreezeJson(value);
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "protocol");
+	}
+	if (!Array.isArray(cloned) || cloned.length === 0) throw createNativeCompactionError("protocol");
+	for (let index = 0; index < cloned.length; index += 1) {
+		const item = cloned[index];
+		if (!isJsonObject(item)) throw createNativeCompactionError("protocol");
+		if (index === cloned.length - 1) {
+			if (
+				item.type !== "compaction" ||
+				typeof item.encrypted_content !== "string" ||
+				item.encrypted_content.length === 0
+			) {
+				throw createNativeCompactionError("protocol");
+			}
+		} else if (item.type !== "message" || item.role !== "user" || !Array.isArray(item.content)) {
+			throw createNativeCompactionError("protocol");
+		}
+	}
+	return cloned;
+}
+
+function readCodexReplayProviderContext(context: Context): ProviderContextEnvelope | undefined {
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(context, "providerContext");
+		if (descriptor === undefined) {
+			if ("providerContext" in context) throw createNativeCompactionError("protocol");
+			return undefined;
+		}
+		if (!descriptor.enumerable || !("value" in descriptor)) throw createNativeCompactionError("protocol");
+		if (descriptor.value === undefined) return undefined;
+		if (typeof descriptor.value !== "object" || descriptor.value === null) {
+			throw createNativeCompactionError("protocol");
+		}
+		return descriptor.value as ProviderContextEnvelope;
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "protocol");
+	}
 }
 
 type SuccessfulAssistantMessage = AssistantMessage & { stopReason: "stop" | "length" | "toolUse" };
@@ -237,6 +567,386 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 	}
 }
 
+function approximateCodexTokens(text: string): number {
+	return Math.ceil(new TextEncoder().encode(text).byteLength / 4);
+}
+
+/** 与 Codex Baseline 相同：按 UTF-8 Byte Budget 保留首尾并在中间插入 Marker。 */
+function truncateCodexTextMiddle(text: string, maxTokens: number): string {
+	if (text.length === 0) return "";
+	const encoder = new TextEncoder();
+	const totalBytes = encoder.encode(text).byteLength;
+	const byteBudget = maxTokens * 4;
+	if (maxTokens > 0 && totalBytes <= byteBudget) return text;
+	if (byteBudget === 0) return `…${approximateCodexTokens(text)} tokens truncated…`;
+	const leftBudget = Math.floor(byteBudget / 2);
+	const rightBudget = byteBudget - leftBudget;
+	const tailStartTarget = Math.max(0, totalBytes - rightBudget);
+	let byteIndex = 0;
+	let prefix = "";
+	let suffix = "";
+	for (const character of text) {
+		const characterBytes = encoder.encode(character).byteLength;
+		const characterEnd = byteIndex + characterBytes;
+		if (characterEnd <= leftBudget) prefix += character;
+		else if (byteIndex >= tailStartTarget) suffix += character;
+		byteIndex = characterEnd;
+	}
+	const removedTokens = Math.ceil(Math.max(0, totalBytes - byteBudget) / 4);
+	return `${prefix}…${removedTokens} tokens truncated…${suffix}`;
+}
+
+function isCodexTextContent(item: JsonValue): item is JsonObject & { readonly text: string } {
+	return (
+		isJsonObject(item) && (item.type === "input_text" || item.type === "output_text") && typeof item.text === "string"
+	);
+}
+
+function isRetainableCodexUserMessage(
+	item: JsonValue,
+): item is JsonObject & { readonly content: readonly JsonValue[] } {
+	return (
+		isJsonObject(item) &&
+		(item.type === undefined || item.type === "message") &&
+		item.role === "user" &&
+		Array.isArray(item.content)
+	);
+}
+
+function normalizeCodexUserMessage(item: JsonObject & { readonly content: readonly JsonValue[] }): JsonObject {
+	return Object.freeze({ type: "message", role: "user", content: item.content });
+}
+
+function codexMessageTextTokenCount(item: JsonObject & { readonly content: readonly JsonValue[] }): number {
+	return item.content.reduce<number>((total, contentItem) => {
+		return total + (isCodexTextContent(contentItem) ? approximateCodexTokens(contentItem.text) : 0);
+	}, 0);
+}
+
+/** 在单条 User Message 内按 Content 顺序消费预算，Image/Audio 永远保留。 */
+function truncateCodexUserMessage(
+	item: JsonObject & { readonly content: readonly JsonValue[] },
+	maxTokens: number,
+): JsonObject | undefined {
+	let remaining = maxTokens;
+	const content: JsonValue[] = [];
+	for (const contentItem of item.content) {
+		if (isCodexTextContent(contentItem)) {
+			if (remaining === 0) continue;
+			const tokens = approximateCodexTokens(contentItem.text);
+			if (tokens <= remaining) {
+				content.push(contentItem);
+				remaining -= tokens;
+			} else {
+				content.push(Object.freeze({ ...contentItem, text: truncateCodexTextMiddle(contentItem.text, remaining) }));
+				remaining = 0;
+			}
+		} else if (
+			isJsonObject(contentItem) &&
+			(contentItem.type === "input_image" || contentItem.type === "input_audio")
+		) {
+			content.push(contentItem);
+		}
+	}
+	if (content.length === 0) return undefined;
+	return Object.freeze({ type: "message", role: "user", content: Object.freeze(content) });
+}
+
+/** 固定 64k 预算，从最新向最旧保留真实 User Message。 */
+function retainCodexCompactionMessages(input: readonly JsonValue[]): readonly JsonValue[] {
+	const candidates = input.filter(isRetainableCodexUserMessage);
+	let remaining = CODEX_REMOTE_COMPACTION_RETAINED_TOKENS;
+	const retainedReversed: JsonValue[] = [];
+	for (let index = candidates.length - 1; index >= 0; index -= 1) {
+		if (remaining === 0) continue;
+		const item = candidates[index];
+		const tokens = Math.max(codexMessageTextTokenCount(item), 1);
+		if (tokens <= remaining) {
+			retainedReversed.push(normalizeCodexUserMessage(item));
+			remaining -= tokens;
+		} else {
+			const truncated = truncateCodexUserMessage(item, remaining);
+			if (truncated) retainedReversed.push(truncated);
+			remaining = 0;
+		}
+	}
+	return Object.freeze(retainedReversed.reverse());
+}
+
+function mapCodexCompactionUsage(value: JsonValue | undefined): NativeCompactionUsage | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!isJsonObject(value)) throw createNativeCompactionError("protocol");
+	const readCount = (key: "input_tokens" | "output_tokens" | "total_tokens"): number => {
+		const count = value[key];
+		if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) {
+			throw createNativeCompactionError("protocol");
+		}
+		return count;
+	};
+	return Object.freeze({
+		inputTokens: readCount("input_tokens"),
+		outputTokens: readCount("output_tokens"),
+		totalTokens: readCount("total_tokens"),
+	});
+}
+
+function readCodexCompactionErrorCode(event: JsonObject): string | undefined {
+	if (typeof event.code === "string") return event.code;
+	if (isJsonObject(event.error) && typeof event.error.code === "string") return event.error.code;
+	if (
+		isJsonObject(event.response) &&
+		isJsonObject(event.response.error) &&
+		typeof event.response.error.code === "string"
+	) {
+		return event.response.error.code;
+	}
+	return undefined;
+}
+
+function throwCodexCompactionEventFailure(event: JsonObject, headers: Headers): never {
+	const code = readCodexCompactionErrorCode(event);
+	if (code && CODEX_REMOTE_COMPACTION_CAPACITY_CODES.has(code)) {
+		throw createNativeCompactionError("capacity");
+	}
+	if (code && CODEX_REMOTE_COMPACTION_RETRYABLE_CODES.has(code)) {
+		throw new CodexCompactionRetryError(undefined, headers);
+	}
+	if (code && CODEX_REMOTE_COMPACTION_TERMINAL_CODES.has(code)) {
+		throw createNativeCompactionError("provider_error");
+	}
+	throw createNativeCompactionError("provider_error");
+}
+
+/** 只收集唯一 Compaction Output，并严格要求 response.completed。 */
+async function collectCodexCompactionSSE(response: Response, signal: AbortSignal | undefined) {
+	const iterator = parseSSE(response, signal, true)[Symbol.asyncIterator]();
+	let compactionItem: JsonObject | undefined;
+	try {
+		for (;;) {
+			let next: IteratorResult<Record<string, unknown>>;
+			try {
+				next = await iterator.next();
+			} catch (error) {
+				throwIfNativeCompactionAborted(signal);
+				if (CODEX_COMPACTION_RETRY_ERRORS.has(error as object)) throw error;
+				const sanitized = sanitizeNativeCompactionError(error, "provider_error");
+				if (sanitized.code !== "provider_error") throw sanitized;
+				throw new CodexCompactionRetryError(undefined, response.headers);
+			}
+			throwIfNativeCompactionAborted(signal);
+			if (next.done) throw new CodexCompactionRetryError(undefined, response.headers);
+			const event = cloneCodexWireJson(next.value);
+			if (!isJsonObject(event) || typeof event.type !== "string") {
+				throw createNativeCompactionError("protocol");
+			}
+			if (event.type === "error" || event.type === "response.failed") {
+				throwCodexCompactionEventFailure(event, response.headers);
+			}
+			if (event.type === "response.incomplete") {
+				throw new CodexCompactionRetryError(undefined, response.headers);
+			}
+			if (
+				event.type === "response.output_item.done" &&
+				isJsonObject(event.item) &&
+				event.item.type === "compaction"
+			) {
+				if (
+					Object.keys(event.item).some((key) => key !== "type" && key !== "id" && key !== "encrypted_content") ||
+					(event.item.id !== undefined && (typeof event.item.id !== "string" || event.item.id.length === 0)) ||
+					typeof event.item.encrypted_content !== "string" ||
+					event.item.encrypted_content.length === 0
+				) {
+					throw createNativeCompactionError("protocol");
+				}
+				if (compactionItem) throw createNativeCompactionError("protocol");
+				compactionItem = event.item;
+				continue;
+			}
+			if (event.type !== "response.completed") continue;
+			if (!compactionItem || !isJsonObject(event.response)) throw createNativeCompactionError("protocol");
+			if (event.response.status !== undefined && event.response.status !== "completed") {
+				throw createNativeCompactionError("protocol");
+			}
+			const usage = mapCodexCompactionUsage(event.response.usage);
+			return Object.freeze({ item: compactionItem, ...(usage ? { usage } : {}) });
+		}
+	} finally {
+		try {
+			await iterator.return?.(undefined);
+		} catch {}
+	}
+}
+
+function addCodexCompactionFeature(headers: Headers): void {
+	const features = new Set(
+		(headers.get("x-codex-beta-features") ?? "")
+			.split(",")
+			.map((feature) => feature.trim())
+			.filter((feature) => feature.length > 0 && feature !== CODEX_REMOTE_COMPACTION_V2_FEATURE),
+	);
+	features.add(CODEX_REMOTE_COMPACTION_V2_FEATURE);
+	headers.set("x-codex-beta-features", [...features].join(","));
+}
+
+function isRetryableCodexCompactionHttpStatus(status: number, errorText: string): boolean {
+	if (status === 429 && isTerminalRateLimitError(errorText)) return false;
+	return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+async function executeCodexCompactionAttempt(
+	request: NativeCompactionProviderRequest<"openai-codex-responses">,
+	body: Uint8Array | string,
+	headers: Headers,
+): Promise<CodexCompactionAttemptResult> {
+	throwIfNativeCompactionAborted(request.options.signal);
+	const headerTimeoutSignal =
+		request.options.timeoutMs !== undefined && request.options.timeoutMs > 0
+			? AbortSignal.timeout(request.options.timeoutMs)
+			: undefined;
+	const combinedSignal = combineAbortSignals([request.options.signal, headerTimeoutSignal]);
+	let response: Response;
+	try {
+		try {
+			response = await (request.options.fetch ?? globalThis.fetch)(request.binding.endpoint, {
+				method: "POST",
+				headers: new Headers(headers),
+				body: body instanceof Uint8Array ? body.slice() : body,
+				signal: combinedSignal.signal,
+			});
+		} catch {
+			throwIfNativeCompactionAborted(request.options.signal);
+			throw new CodexCompactionRetryError();
+		}
+	} finally {
+		combinedSignal.cleanup();
+	}
+	throwIfNativeCompactionAborted(request.options.signal);
+	try {
+		await request.options.onResponse?.(
+			{ status: response.status, headers: headersToRecord(response.headers) },
+			request.model,
+		);
+	} catch (error) {
+		throwIfNativeCompactionAborted(request.options.signal);
+		throw sanitizeNativeCompactionError(error, "provider_error");
+	}
+	throwIfNativeCompactionAborted(request.options.signal);
+	if (!response.ok) {
+		let errorText: string;
+		try {
+			errorText = await response.text();
+		} catch {
+			throwIfNativeCompactionAborted(request.options.signal);
+			throw new CodexCompactionRetryError();
+		}
+		throwIfNativeCompactionAborted(request.options.signal);
+		if (isRetryableCodexCompactionHttpStatus(response.status, errorText)) {
+			throw new CodexCompactionRetryError(response.status, response.headers);
+		}
+		throw createNativeCompactionError("provider_error");
+	}
+	if (!response.body) throw new CodexCompactionRetryError();
+	return collectCodexCompactionSSE(response, request.options.signal);
+}
+
+function buildCodexCompactionPayload(
+	request: NativeCompactionProviderRequest<"openai-codex-responses">,
+	prefix: readonly JsonValue[],
+): NativeCodexRequestBody {
+	const grammarToolInputProperties = createGrammarToolInputProperties(
+		request.context.tools,
+		request.model.compat?.supportsOpenAIGrammarTools ?? false,
+	);
+	const cacheSessionId = request.options.cacheRetention === "none" ? undefined : request.options.sessionId;
+	const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
+	const body = buildRequestBody(
+		request.model,
+		request.context,
+		request.options,
+		codexSessionId,
+		grammarToolInputProperties,
+	);
+	body.input = [
+		...prefix,
+		...((body.input ?? []) as unknown as readonly JsonValue[]),
+		{ type: "compaction_trigger" },
+	] as unknown as ResponseInput;
+	return projectNativeCodexPayload(body, request.model.id, prefix, true);
+}
+
+export const resolveNativeCompactionEndpoint = resolveOpenAICodexCompactionEndpoint;
+
+/** Models Preflight 后登记一次性 Replay Handoff。 */
+export async function canConsumeProviderContext(
+	request: NativeCompactionProviderRequest<"openai-codex-responses">,
+): Promise<boolean> {
+	assertNativeCompactionProviderRequest(request);
+	throwIfNativeCompactionAborted(request.options.signal);
+	if (request.providerContext === undefined) return false;
+	if (request.binding.protocol !== "openai-codex-remote-v2") throw createNativeCompactionError("protocol");
+	validateCodexCanonicalItems(request.providerContext.items);
+	AUTHORIZED_CODEX_REPLAY_CONTEXTS.add(request.providerContext);
+	return true;
+}
+
+/** 调用 Codex Remote Compaction V2，并返回可持久化的 Canonical Envelope。 */
+export async function compact(
+	request: NativeCompactionProviderRequest<"openai-codex-responses">,
+): Promise<NativeCompactionResult> {
+	assertNativeCompactionProviderRequest(request);
+	try {
+		throwIfNativeCompactionAborted(request.options.signal);
+		const endpoint = resolveOpenAICodexCompactionEndpoint(request.model, request.options);
+		if (endpoint.endpoint !== request.binding.endpoint || endpoint.protocol !== request.binding.protocol) {
+			throw createNativeCompactionError("binding_mismatch");
+		}
+		const prefix = request.providerContext ? validateCodexCanonicalItems(request.providerContext.items) : [];
+		let payload = buildCodexCompactionPayload(request, prefix);
+		let nextPayload: unknown;
+		try {
+			nextPayload = await request.options.onPayload?.(payload, request.model);
+		} catch (error) {
+			throwIfNativeCompactionAborted(request.options.signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+		throwIfNativeCompactionAborted(request.options.signal);
+		if (nextPayload !== undefined) {
+			payload = validateNativeCodexPayload(nextPayload, request.model.id, prefix, true);
+		}
+		const token = request.options.apiKey;
+		const accountId = token ? parseOpenAICodexAccountId(token) : undefined;
+		if (!token || !accountId) throw createNativeCompactionError("unsupported");
+		const cacheSessionId = request.options.cacheRetention === "none" ? undefined : request.options.sessionId;
+		const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
+		const headers = buildSSEHeaders(request.model.headers, request.options.headers, accountId, token, codexSessionId);
+		addCodexCompactionFeature(headers);
+		const bodyJson = JSON.stringify(payload);
+		const compressedBody = compressRequestBodyZstd(bodyJson);
+		if (compressedBody) headers.set("content-encoding", "zstd");
+		const body = compressedBody ?? bodyJson;
+		const maxRetries = Math.min(request.options.maxRetries ?? CODEX_REMOTE_COMPACTION_MAX_RETRIES, 2);
+		const attempt = await retryProviderRequest(() => executeCodexCompactionAttempt(request, body, headers), {
+			maxRetries,
+			maxRetryDelayMs: request.options.maxRetryDelayMs,
+			signal: request.options.signal,
+		});
+		throwIfNativeCompactionAborted(request.options.signal);
+		const retained = retainCodexCompactionMessages((payload.input as readonly JsonValue[]).slice(0, -1));
+		return validateNativeCompactionResult({
+			providerContext: {
+				format: "openai-responses-compaction",
+				version: 1,
+				binding: request.binding,
+				items: [...retained, attempt.item],
+			},
+			...(attempt.usage ? { usage: attempt.usage } : {}),
+		});
+	} catch (error) {
+		throwIfNativeCompactionAborted(request.options.signal);
+		throw sanitizeNativeCompactionError(error, "provider_error");
+	}
+}
+
 // ============================================================================
 // Main Stream Function
 // ============================================================================
@@ -249,6 +959,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
+		let nativeReplay = false;
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
@@ -268,6 +979,16 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 		};
 
 		try {
+			const providerContext = readCodexReplayProviderContext(context);
+			let replayItems: readonly JsonValue[] | undefined;
+			if (providerContext !== undefined) {
+				nativeReplay = true;
+				throwIfNativeCompactionAborted(options?.signal);
+				if (!AUTHORIZED_CODEX_REPLAY_CONTEXTS.delete(providerContext)) {
+					throw createNativeCompactionError("unsupported");
+				}
+				replayItems = validateCodexCanonicalItems(providerContext.items);
+			}
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error(`No API key for provider: ${model.provider}`);
@@ -281,9 +1002,19 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
 			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
 			let body = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);
+			if (replayItems !== undefined) {
+				body.input = [
+					...replayItems,
+					...((body.input ?? []) as unknown as readonly JsonValue[]),
+				] as unknown as ResponseInput;
+				body = projectNativeCodexPayload(body, model.id, replayItems, false);
+			}
 			const nextBody = await options?.onPayload?.(body, model);
+			if (nativeReplay) throwIfNativeCompactionAborted(options?.signal);
 			if (nextBody !== undefined) {
-				body = nextBody as RequestBody;
+				body = replayItems
+					? validateNativeCodexPayload(nextBody, model.id, replayItems, false)
+					: (nextBody as RequestBody);
 			}
 			const websocketRequestId = codexSessionId || uuidv7();
 			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
@@ -297,7 +1028,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			const bodyJson = JSON.stringify(body);
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
-			const transport = options?.transport || "auto";
+			const transport = nativeReplay ? "sse" : options?.transport || "auto";
 			let startEmitted = false;
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
 			if (websocketDisabledForSession) {
@@ -402,12 +1133,17 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
 					const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
 					try {
-						response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
-							method: "POST",
-							headers: sseHeaders,
-							body: sseBody,
-							signal: combinedSignal.signal,
-						});
+						response = await (options?.fetch ?? globalThis.fetch)(
+							nativeReplay && providerContext
+								? providerContext.binding.endpoint
+								: resolveOpenAICodexResponsesUrl(model.baseUrl),
+							{
+								method: "POST",
+								headers: sseHeaders,
+								body: sseBody,
+								signal: combinedSignal.signal,
+							},
+						);
 					} catch (error) {
 						if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) {
 							throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
@@ -416,10 +1152,12 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} finally {
 						combinedSignal.cleanup();
 					}
+					if (nativeReplay) throwIfNativeCompactionAborted(options?.signal);
 					await options?.onResponse?.(
 						{ status: response.status, headers: headersToRecord(response.headers) },
 						model,
 					);
+					if (nativeReplay) throwIfNativeCompactionAborted(options?.signal);
 
 					if (response.ok) {
 						break;
@@ -478,6 +1216,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				stream.push({ type: "start", partial: output });
 			}
 			await processStream(response, output, stream, model, grammarToolInputProperties, options);
+			if (nativeReplay) throwIfNativeCompactionAborted(options?.signal);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -493,7 +1232,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			output.errorMessage = nativeReplay
+				? sanitizeNativeCompactionError(error, "provider_error").message
+				: formatProviderError(normalizeProviderError(error));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -634,16 +1375,8 @@ function resolveCodexServiceTier(
 	return responseServiceTier ?? requestServiceTier;
 }
 
-function resolveCodexUrl(baseUrl?: string): string {
-	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_CODEX_BASE_URL;
-	const normalized = raw.replace(/\/+$/, "");
-	if (normalized.endsWith("/codex/responses")) return normalized;
-	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
-	return `${normalized}/codex/responses`;
-}
-
 function resolveCodexWebSocketUrl(baseUrl?: string): string {
-	const url = new URL(resolveCodexUrl(baseUrl));
+	const url = new URL(resolveOpenAICodexResponsesUrl(baseUrl));
 	if (url.protocol === "https:") url.protocol = "wss:";
 	if (url.protocol === "http:") url.protocol = "ws:";
 	return url.toString();
@@ -760,7 +1493,11 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 // SSE Parsing
 // ============================================================================
 
-async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+async function* parseSSE(
+	response: Response,
+	signal?: AbortSignal,
+	nativeCompaction: boolean = false,
+): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
 	const reader = response.body.getReader();
@@ -798,6 +1535,7 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 						try {
 							yield JSON.parse(data) as Record<string, unknown>;
 						} catch (cause) {
+							if (nativeCompaction) throw createNativeCompactionError("protocol");
 							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
 								cause,
 								payload: data,
@@ -1562,16 +2300,9 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 // ============================================================================
 
 function extractAccountId(token: string): string {
-	try {
-		const parts = token.split(".");
-		if (parts.length !== 3) throw new Error("Invalid token");
-		const payload = JSON.parse(atob(parts[1]));
-		const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
-		if (!accountId) throw new Error("No account ID in token");
-		return accountId;
-	} catch {
-		throw new Error("Failed to extract accountId from token");
-	}
+	const accountId = parseOpenAICodexAccountId(token);
+	if (!accountId) throw new Error("Failed to extract accountId from token");
+	return accountId;
 }
 
 function buildBaseCodexHeaders(

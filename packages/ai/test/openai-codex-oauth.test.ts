@@ -476,4 +476,43 @@ describe("OpenAI Codex OAuth", () => {
 		).rejects.toThrow(/OpenAI Codex token refresh failed \(401\).*Could not validate your token/);
 		expect(consoleError).not.toHaveBeenCalled();
 	});
+
+	it("derives the stable subject from the final access token", async () => {
+		const access = createAccessToken("account-from-token");
+		await expect(
+			openaiCodexOAuth.getStableSubject?.({
+				type: "oauth",
+				access,
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			}),
+		).resolves.toBe("account-from-token");
+	});
+
+	it("rejects a stored account ID that differs from the final access token", async () => {
+		const access = createAccessToken("account-from-token");
+		await expect(
+			openaiCodexOAuth.getStableSubject?.({
+				type: "oauth",
+				access,
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+				accountId: "different-stored-account",
+			}),
+		).resolves.toBeUndefined();
+	});
+
+	it("rejects malformed or subject-less final access tokens", async () => {
+		const subjectless = `${Buffer.from("{}").toString("base64url")}.${Buffer.from("{}").toString("base64url")}.sig`;
+		for (const access of ["not-a-jwt", subjectless]) {
+			await expect(
+				openaiCodexOAuth.getStableSubject?.({
+					type: "oauth",
+					access,
+					refresh: "refresh-token",
+					expires: Date.now() + 60_000,
+				}),
+			).resolves.toBeUndefined();
+		}
+	});
 });

@@ -25,6 +25,13 @@ const authContext: AuthContext = {
 	fileExists: async () => false,
 };
 
+function openAICodexAccessToken(accountId: string): string {
+	const payload = Buffer.from(
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
+	).toString("base64url");
+	return `header.${payload}.signature`;
+}
+
 function nativeModel<TApi extends NativeCompactionApi>(provider: string, api: TApi): Model<TApi> {
 	return {
 		id: "gpt-test",
@@ -183,7 +190,7 @@ describe("Models native compaction preflight", () => {
 		expect(
 			await openaiCodexOAuth.getStableSubject?.({
 				type: "oauth",
-				access: "opaque",
+				access: openAICodexAccessToken("account-a"),
 				refresh: "opaque",
 				expires: 1,
 				accountId: "account-a",
