@@ -41,6 +41,8 @@ import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
+import { lazyStream } from "./utils/lazy-stream.ts";
+import { createNativeCompactionError } from "./utils/native-compaction.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
 
@@ -99,6 +101,28 @@ type RegisteredApiProvider = {
 
 const apiProviderRegistry = new Map<string, RegisteredApiProvider>();
 
+type ProviderContextState = "absent" | "present" | "invalid";
+
+function inspectProviderContext(context: unknown): ProviderContextState {
+	try {
+		if (typeof context !== "object" || context === null) return "invalid";
+		const descriptor = Object.getOwnPropertyDescriptor(context, "providerContext");
+		if (descriptor) {
+			if (!descriptor.enumerable || !("value" in descriptor)) return "invalid";
+			return descriptor.value === undefined ? "absent" : "present";
+		}
+		return "providerContext" in context ? "invalid" : "absent";
+	} catch {
+		return "invalid";
+	}
+}
+
+function unsupportedProviderContextStream(model: Model<Api>): AssistantMessageEventStream {
+	return lazyStream(model, async () => {
+		throw createNativeCompactionError("unsupported");
+	});
+}
+
 function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 	api: TApi,
 	stream: StreamFunction<TApi, TOptions>,
@@ -107,6 +131,7 @@ function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
+		if (inspectProviderContext(context) !== "absent") return unsupportedProviderContextStream(model);
 		return stream(model as Model<TApi>, context, options as TOptions);
 	};
 }
@@ -119,6 +144,7 @@ function wrapStreamSimple<TApi extends Api>(
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
+		if (inspectProviderContext(context) !== "absent") return unsupportedProviderContextStream(model);
 		return streamSimple(model as Model<TApi>, context, options);
 	};
 }
@@ -253,6 +279,13 @@ export function stream<TApi extends Api>(
 	options?: ProviderStreamOptions,
 ): AssistantMessageEventStream {
 	const builtinProvider = getBuiltinProviderForModel(model);
+	const providerContextState = inspectProviderContext(context);
+	if (providerContextState !== "absent") {
+		if (providerContextState === "present" && builtinProvider) {
+			return compatModels.stream(model, context, options as ModelsApiStreamOptions<TApi> | undefined);
+		}
+		return unsupportedProviderContextStream(model);
+	}
 	if (builtinProvider) {
 		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
 			return compatModels.stream(model, context, options as ModelsApiStreamOptions<TApi> | undefined);
@@ -278,6 +311,13 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const builtinProvider = getBuiltinProviderForModel(model);
+	const providerContextState = inspectProviderContext(context);
+	if (providerContextState !== "absent") {
+		if (providerContextState === "present" && builtinProvider) {
+			return compatModels.streamSimple(model, context, options);
+		}
+		return unsupportedProviderContextStream(model);
+	}
 	if (builtinProvider) {
 		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
 			return compatModels.streamSimple(model, context, options);

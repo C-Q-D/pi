@@ -1,4 +1,3 @@
-import { lazyStream } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
 import {
@@ -46,6 +45,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { sha256Hex } from "./utils/hash.ts";
+import { lazyStream } from "./utils/lazy-stream.ts";
 import {
 	cloneAndFreezeJson,
 	cloneAndFreezeProviderContext,
@@ -54,6 +54,7 @@ import {
 	validateNativeCompactionResult,
 } from "./utils/native-compaction.ts";
 import { cloneAndFreezeNativeContext } from "./utils/native-context.ts";
+import { validateNativeCompactionEndpoint } from "./utils/native-endpoint.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -479,49 +480,6 @@ function hasAnyNativeCompactionCapability(streams: ProviderStreamsRuntime): bool
 export function assertNativeCompactionProviderRequest(request: NativeCompactionProviderRequest): void {
 	if (!NATIVE_COMPACTION_PROVIDER_REQUESTS.has(request)) {
 		throw createNativeCompactionError("unsupported");
-	}
-}
-
-/** 校验并冻结 Adapter 返回的 Endpoint Identity。 */
-function validateNativeCompactionEndpoint<TApi extends NativeCompactionApi>(
-	api: TApi,
-	value: unknown,
-): NativeCompactionEndpoint<TApi> {
-	try {
-		const properties = readNativeCompactionObject(value);
-		if (properties.size !== 2 || !properties.has("endpoint") || !properties.has("protocol")) {
-			throw createNativeCompactionError("protocol");
-		}
-		const endpoint = properties.get("endpoint");
-		const protocol = properties.get("protocol");
-		const protocolMatchesApi =
-			api === "openai-responses"
-				? protocol === "openai-responses-compact"
-				: protocol === "openai-codex-remote-v2" || protocol === "openai-codex-compact-legacy";
-		if (
-			typeof endpoint !== "string" ||
-			endpoint.length === 0 ||
-			CONTROL_CHARACTER_PATTERN.test(endpoint) ||
-			endpoint.includes("#")
-		) {
-			throw createNativeCompactionError("protocol");
-		}
-		const parsed = new URL(endpoint);
-		if (
-			(parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-			parsed.username.length > 0 ||
-			parsed.password.length > 0 ||
-			parsed.hash.length > 0 ||
-			!protocolMatchesApi
-		) {
-			throw createNativeCompactionError("protocol");
-		}
-		return Object.freeze({
-			endpoint,
-			protocol: protocol as NativeCompactionEndpoint<TApi>["protocol"],
-		});
-	} catch {
-		throw createNativeCompactionError("protocol");
 	}
 }
 
