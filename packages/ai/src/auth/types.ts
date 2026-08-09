@@ -202,6 +202,13 @@ export interface OAuthAuth {
 	refresh(credential: OAuthCredential, signal?: AbortSignal): Promise<OAuthCredential>;
 
 	/**
+	 * Return the provider-owned stable account identity used to bind opaque
+	 * provider context across access-token refreshes. Implementations must not
+	 * derive this from arbitrary credential fields at the Models layer.
+	 */
+	getStableSubject?(credential: OAuthCredential): Promise<string | undefined>;
+
+	/**
 	 * Side-effect-free derivation of request auth from a valid credential.
 	 * Covers per-credential baseUrl (GitHub Copilot). Async so lazy wrappers
 	 * can load the implementation on first use.

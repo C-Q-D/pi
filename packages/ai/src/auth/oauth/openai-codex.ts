@@ -168,7 +168,7 @@ async function exchangeAuthorizationCode(
 	return readTokenResponse(response, "exchange");
 }
 
-async function refreshAccessToken(refreshToken: string): Promise<OAuthToken> {
+async function refreshAccessToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthToken> {
 	let response: Response;
 	try {
 		response = await fetch(TOKEN_URL, {
@@ -179,6 +179,7 @@ async function refreshAccessToken(refreshToken: string): Promise<OAuthToken> {
 				refresh_token: refreshToken,
 				client_id: CLIENT_ID,
 			}),
+			signal,
 		});
 	} catch (error) {
 		throw new Error(`OpenAI Codex token refresh error: ${error instanceof Error ? error.message : String(error)}`);
@@ -503,8 +504,8 @@ async function loginOpenAICodex(interaction: AuthInteraction): Promise<OAuthCred
 /**
  * Refresh OpenAI Codex OAuth token
  */
-async function refreshOpenAICodexToken(refreshToken: string): Promise<OAuthCredential> {
-	return credentialsFromToken(await refreshAccessToken(refreshToken));
+async function refreshOpenAICodexToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthCredential> {
+	return credentialsFromToken(await refreshAccessToken(refreshToken, signal));
 }
 
 export const openaiCodexOAuth: OAuthAuth = {
@@ -530,7 +531,13 @@ export const openaiCodexOAuth: OAuthAuth = {
 		return loginOpenAICodex(interaction);
 	},
 
-	refresh: (credential) => refreshOpenAICodexToken(credential.refresh),
+	refresh: (credential, signal) => refreshOpenAICodexToken(credential.refresh, signal),
+
+	async getStableSubject(credential) {
+		return typeof credential.accountId === "string" && credential.accountId.length > 0
+			? credential.accountId
+			: undefined;
+	},
 
 	async toAuth(credential) {
 		return { apiKey: credential.access };

@@ -1,7 +1,13 @@
 import { lazyStream } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
-import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
+import {
+	type AuthResolutionOverrides,
+	getEffectiveAuthMetadata,
+	inheritEffectiveAuthMetadata,
+	ModelsError,
+	resolveProviderAuth,
+} from "./auth/resolve.ts";
 import type {
 	AuthCheck,
 	AuthContext,
@@ -30,6 +36,8 @@ import type {
 	NativeCompactionResult,
 	NoNativeCompactionProviderCapabilities,
 	OptionalNativeCompactionProviderCapabilities,
+	ProviderContextBinding,
+	ProviderContextEnvelope,
 	ProviderHeaders,
 	ProviderStreamMethods,
 	ProviderStreams,
@@ -37,7 +45,15 @@ import type {
 	StreamOptions,
 	Usage,
 } from "./types.ts";
-import { createNativeCompactionError, sanitizeNativeCompactionError } from "./utils/native-compaction.ts";
+import { sha256Hex } from "./utils/hash.ts";
+import {
+	cloneAndFreezeJson,
+	cloneAndFreezeProviderContext,
+	createNativeCompactionError,
+	sanitizeNativeCompactionError,
+	validateNativeCompactionResult,
+} from "./utils/native-compaction.ts";
+import { cloneAndFreezeNativeContext } from "./utils/native-context.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -151,6 +167,10 @@ export type Provider<TApi extends Api = never> = [TApi] extends [never]
  * delegates each request to the provider that owns the model.
  */
 export interface Models {
+	/** Optional on read-only wrappers; createModels() always returns the complete capability. */
+	readonly compact?: NativeCompactionModels["compact"];
+	readonly canConsumeProviderContext?: NativeCompactionModels["canConsumeProviderContext"];
+
 	getProviders(): readonly Provider[];
 	getProvider(id: string): Provider | undefined;
 
@@ -212,12 +232,28 @@ export interface Models {
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage>;
 }
 
-export interface MutableModels extends Models {
-	/** Upsert/replace by provider.id. Provider ids are unique. */
-	setProvider(provider: Provider): void;
-	deleteProvider(id: string): void;
-	clearProviders(): void;
+/** Models collection with the native compaction entry points introduced by the preflight layer. */
+export interface NativeCompactionModels {
+	compact<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		context: Context,
+		options?: NativeCompactionPublicOptionsMap[TApi],
+	): Promise<NativeCompactionResult>;
+
+	canConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: NativeCompactionPublicOptionsMap[TApi],
+	): Promise<boolean>;
 }
+
+export type MutableModels = Models &
+	NativeCompactionModels & {
+		/** Upsert/replace by provider.id. Provider ids are unique. */
+		setProvider(provider: Provider): void;
+		deleteProvider(id: string): void;
+		clearProviders(): void;
+	};
 
 export interface CreateModelsOptions {
 	credentials?: CredentialStore;
@@ -466,6 +502,16 @@ function validateNativeCompactionEndpoint<TApi extends NativeCompactionApi>(
 			typeof endpoint !== "string" ||
 			endpoint.length === 0 ||
 			CONTROL_CHARACTER_PATTERN.test(endpoint) ||
+			endpoint.includes("#")
+		) {
+			throw createNativeCompactionError("protocol");
+		}
+		const parsed = new URL(endpoint);
+		if (
+			(parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+			parsed.username.length > 0 ||
+			parsed.password.length > 0 ||
+			parsed.hash.length > 0 ||
 			!protocolMatchesApi
 		) {
 			throw createNativeCompactionError("protocol");
@@ -477,6 +523,220 @@ function validateNativeCompactionEndpoint<TApi extends NativeCompactionApi>(
 	} catch {
 		throw createNativeCompactionError("protocol");
 	}
+}
+
+type NarrowedNativeProvider<TApi extends NativeCompactionApi> = ProviderCore<TApi> &
+	NativeCompactionProviderCapabilities<TApi>;
+
+interface NativeCompactionPreflight<TApi extends NativeCompactionApi> {
+	readonly provider: NarrowedNativeProvider<TApi>;
+	readonly request: NativeCompactionProviderRequest<TApi>;
+	readonly streamContext: Context;
+	readonly streamOptions: StreamOptions;
+}
+
+/** 唯一的异构 Provider → 具体 Native API 运行时收窄点。 */
+function narrowNativeCompactionProvider<TApi extends NativeCompactionApi>(
+	provider: Provider,
+	api: TApi,
+): NarrowedNativeProvider<TApi> {
+	const runtime = provider as ProviderCore<Api> & ProviderStreamsRuntime;
+	if (!isNativeCompactionApi(api) || !hasNativeCompactionCapabilities(runtime)) {
+		throw createNativeCompactionError("unsupported");
+	}
+	return runtime as unknown as NarrowedNativeProvider<TApi>;
+}
+
+function throwIfNativeCompactionAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
+}
+
+function cloneNativeModel<TApi extends NativeCompactionApi>(model: Model<TApi>): Readonly<Model<TApi>> {
+	try {
+		const properties = readNativeCompactionObject(model);
+		const required = [
+			"id",
+			"name",
+			"api",
+			"provider",
+			"baseUrl",
+			"reasoning",
+			"input",
+			"cost",
+			"contextWindow",
+			"maxTokens",
+		] as const;
+		const allowed = new Set([...required, "thinkingLevelMap", "headers", "compat"]);
+		for (const key of properties.keys()) {
+			if (!allowed.has(key)) throw createNativeCompactionError("invalid_context");
+		}
+		for (const key of required) {
+			if (!properties.has(key)) throw createNativeCompactionError("invalid_context");
+		}
+		const clone = cloneAndFreezeJson(model);
+		const snapshot = readNativeCompactionObject(clone);
+		for (const key of ["id", "name", "provider", "baseUrl"] as const) {
+			const value = snapshot.get(key);
+			if (typeof value !== "string" || value.length === 0 || CONTROL_CHARACTER_PATTERN.test(value)) {
+				throw createNativeCompactionError("invalid_context");
+			}
+		}
+		if (!isNativeCompactionApi(snapshot.get("api") as Api)) {
+			throw createNativeCompactionError("unsupported");
+		}
+		if (typeof snapshot.get("reasoning") !== "boolean") {
+			throw createNativeCompactionError("invalid_context");
+		}
+		for (const key of ["contextWindow", "maxTokens"] as const) {
+			const value = snapshot.get(key);
+			if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+				throw createNativeCompactionError("invalid_context");
+			}
+		}
+		const input = snapshot.get("input");
+		if (!Array.isArray(input) || input.length === 0 || input.some((value) => value !== "text" && value !== "image")) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		validateNativeModelCost(snapshot.get("cost"));
+		if (snapshot.has("headers")) cloneNativeCompactionRecord(snapshot.get("headers"), false);
+		if (snapshot.has("thinkingLevelMap")) validateNativeThinkingLevelMap(snapshot.get("thinkingLevelMap"));
+		if (snapshot.has("compat")) validateNativeResponsesCompat(snapshot.get("compat"));
+		return clone as unknown as Readonly<Model<TApi>>;
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "invalid_context");
+	}
+}
+
+function validateFiniteNonNegativeRecord(value: unknown, required: readonly string[]): void {
+	const properties = readNativeCompactionObject(value);
+	if (properties.size !== required.length) throw createNativeCompactionError("invalid_context");
+	for (const key of required) {
+		const entry = properties.get(key);
+		if (typeof entry !== "number" || !Number.isFinite(entry) || entry < 0) {
+			throw createNativeCompactionError("invalid_context");
+		}
+	}
+}
+
+function validateNativeModelCost(value: unknown): void {
+	const properties = readNativeCompactionObject(value);
+	const required = ["input", "output", "cacheRead", "cacheWrite"] as const;
+	for (const key of properties.keys()) {
+		if (![...required, "tiers"].includes(key as (typeof required)[number] | "tiers")) {
+			throw createNativeCompactionError("invalid_context");
+		}
+	}
+	for (const key of required) {
+		const entry = properties.get(key);
+		if (typeof entry !== "number" || !Number.isFinite(entry) || entry < 0) {
+			throw createNativeCompactionError("invalid_context");
+		}
+	}
+	if (properties.has("tiers")) {
+		const tiers = properties.get("tiers");
+		if (!Array.isArray(tiers)) throw createNativeCompactionError("invalid_context");
+		for (const tier of tiers) {
+			validateFiniteNonNegativeRecord(tier, ["inputTokensAbove", ...required]);
+		}
+	}
+}
+
+function validateNativeThinkingLevelMap(value: unknown): void {
+	const properties = readNativeCompactionObject(value);
+	const allowed = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	for (const [key, entry] of properties) {
+		if (!allowed.has(key) || (entry !== null && typeof entry !== "string")) {
+			throw createNativeCompactionError("invalid_context");
+		}
+	}
+}
+
+function validateNativeResponsesCompat(value: unknown): void {
+	const properties = readNativeCompactionObject(value);
+	const booleanKeys = new Set([
+		"supportsDeveloperRole",
+		"supportsLongCacheRetention",
+		"supportsStrictMode",
+		"supportsOpenAIGrammarTools",
+		"supportsToolSearch",
+		"supportsExplicitPromptCacheMode",
+	]);
+	for (const [key, entry] of properties) {
+		if (key === "sessionAffinityFormat") {
+			if (entry !== "openai" && entry !== "openai-nosession" && entry !== "openrouter") {
+				throw createNativeCompactionError("invalid_context");
+			}
+		} else if (!booleanKeys.has(key) || typeof entry !== "boolean") {
+			throw createNativeCompactionError("invalid_context");
+		}
+	}
+}
+
+function cloneStreamOptionsForNative(options: unknown, skipUndefined = false): StreamOptions {
+	try {
+		const properties = readNativeCompactionObject(options ?? {});
+		const clone: Record<string, unknown> = {};
+		for (const [key, value] of properties) {
+			if (value === undefined) {
+				if (skipUndefined) continue;
+				throw createNativeCompactionError("invalid_context");
+			}
+			if (typeof value === "function" || value instanceof AbortSignal) {
+				clone[key] = value;
+			} else {
+				clone[key] = cloneAndFreezeJson(value);
+			}
+		}
+		return Object.freeze(clone) as StreamOptions;
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "invalid_context");
+	}
+}
+
+function selectNativeCompactionOptions<TApi extends NativeCompactionApi>(
+	api: TApi,
+	options: unknown,
+): Readonly<NativeCompactionPublicOptionsMap[TApi]> {
+	const properties = readNativeCompactionObject(options ?? {});
+	const allowed = api === "openai-responses" ? OPENAI_RESPONSES_NATIVE_OPTION_KEYS : OPENAI_CODEX_NATIVE_OPTION_KEYS;
+	const selected: Record<string, unknown> = {};
+	for (const [key, value] of properties) {
+		if (allowed.has(key) && value !== undefined) selected[key] = value;
+	}
+	return validateNativeCompactionOptions(api, selected);
+}
+
+function hasAuthorizationHeader(headers: ProviderHeaders | undefined): boolean {
+	return Object.keys(headers ?? {}).some((name) => name.toLowerCase() === "authorization");
+}
+
+function readContextProviderContext(context: unknown): unknown {
+	try {
+		if (typeof context !== "object" || context === null) return undefined;
+		const descriptor = Object.getOwnPropertyDescriptor(context, "providerContext");
+		if (!descriptor) {
+			if ("providerContext" in context) throw createNativeCompactionError("invalid_context");
+			return undefined;
+		}
+		if (!descriptor.enumerable || !("value" in descriptor)) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		return descriptor.value;
+	} catch (error) {
+		throw sanitizeNativeCompactionError(error, "invalid_context");
+	}
+}
+
+function bindingsMatch(left: ProviderContextBinding, right: ProviderContextBinding): boolean {
+	return (
+		left.provider === right.provider &&
+		left.api === right.api &&
+		left.model === right.model &&
+		left.endpoint === right.endpoint &&
+		left.format === right.format &&
+		left.protocol === right.protocol &&
+		left.credentialScopeHash === right.credentialScopeHash
+	);
 }
 
 class ModelsImpl implements MutableModels {
@@ -683,13 +943,13 @@ class ModelsImpl implements MutableModels {
 		if (!provider) return undefined;
 		const result = await resolveProviderAuth(provider, this.credentials, this.authContext, overrides);
 		if (!result || typeof providerOrModel === "string" || !providerOrModel.headers) return result;
-		return {
+		return inheritEffectiveAuthMetadata(result, {
 			...result,
 			auth: {
 				...result.auth,
 				headers: mergeHeaders(result.auth.headers, providerOrModel.headers),
 			},
-		};
+		});
 	}
 
 	async login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
@@ -727,11 +987,12 @@ class ModelsImpl implements MutableModels {
 	private async applyAuth<TOptions extends StreamOptions & ModelsStreamTransforms>(
 		model: Model<Api>,
 		options: TOptions | undefined,
-	): Promise<{ requestModel: Model<Api>; requestOptions: StreamOptions | undefined }> {
+	): Promise<{ requestModel: Model<Api>; requestOptions: StreamOptions | undefined; resolution: AuthResult }> {
 		this.requireProvider(model);
 		const resolution = await this.getAuth(model, {
 			apiKey: options?.apiKey,
 			env: options?.env,
+			signal: options?.signal,
 		});
 		if (!resolution) {
 			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
@@ -747,7 +1008,229 @@ class ModelsImpl implements MutableModels {
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 		const requestOptions = { ...providerOptions, apiKey, headers, env } as StreamOptions;
 
-		return { requestModel, requestOptions };
+		return { requestModel, requestOptions, resolution };
+	}
+
+	private async resolveNativeCredentialScope(
+		api: NativeCompactionApi,
+		provider: Provider,
+		resolution: AuthResult,
+		options: Readonly<NativeCompactionPublicOptionsMap[NativeCompactionApi]>,
+		signal: AbortSignal | undefined,
+	): Promise<string> {
+		const metadata = getEffectiveAuthMetadata(resolution);
+		if (api === "openai-responses") {
+			if (metadata?.kind !== "api_key" || typeof options.apiKey !== "string" || options.apiKey.length === 0) {
+				throw createNativeCompactionError("unsupported");
+			}
+			try {
+				const hash = await sha256Hex(`api-key:${options.apiKey}`);
+				throwIfNativeCompactionAborted(signal);
+				return hash;
+			} catch (error) {
+				throwIfNativeCompactionAborted(signal);
+				throw sanitizeNativeCompactionError(error, "provider_error");
+			}
+		}
+
+		if (metadata?.kind !== "oauth" || !metadata.getStableSubject) {
+			throw createNativeCompactionError("unsupported");
+		}
+		if (typeof options.apiKey !== "string" || options.apiKey.length === 0) {
+			throw createNativeCompactionError("unsupported");
+		}
+		try {
+			const subject = await metadata.getStableSubject(metadata.finalCredential);
+			throwIfNativeCompactionAborted(signal);
+			if (!subject || CONTROL_CHARACTER_PATTERN.test(subject)) {
+				throw createNativeCompactionError("unsupported");
+			}
+			if (metadata.previousSubject) {
+				if (metadata.previousSubject.status === "error") {
+					throw createNativeCompactionError("provider_error");
+				}
+				if (!metadata.previousSubject.value || metadata.previousSubject.value !== subject) {
+					throw createNativeCompactionError("unsupported");
+				}
+			}
+			const hash = await sha256Hex(`chatgpt-account:${subject}:${provider.id}`);
+			throwIfNativeCompactionAborted(signal);
+			return hash;
+		} catch (error) {
+			throwIfNativeCompactionAborted(signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+	}
+
+	private async nativeCompactionPreflight<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		context: Context,
+		options: unknown,
+		inputKind: "native" | "stream",
+	): Promise<NativeCompactionPreflight<TApi>> {
+		let rawOptionProperties: ReadonlyMap<string, unknown>;
+		try {
+			rawOptionProperties = readNativeCompactionObject(options ?? {});
+		} catch (error) {
+			throw sanitizeNativeCompactionError(error, "invalid_context");
+		}
+		let signal: AbortSignal | undefined;
+		try {
+			const rawSignal = rawOptionProperties.get("signal");
+			if (rawSignal !== undefined && !(rawSignal instanceof AbortSignal)) {
+				throw createNativeCompactionError("invalid_context");
+			}
+			signal = rawSignal as AbortSignal | undefined;
+		} catch (error) {
+			throw sanitizeNativeCompactionError(error, "invalid_context");
+		}
+		throwIfNativeCompactionAborted(signal);
+		const inputModelSnapshot = cloneNativeModel(model);
+		if (!isNativeCompactionApi(inputModelSnapshot.api)) throw createNativeCompactionError("unsupported");
+		const providerCandidate = this.providers.get(inputModelSnapshot.provider);
+		if (!providerCandidate) throw createNativeCompactionError("unsupported");
+		const provider = narrowNativeCompactionProvider(providerCandidate, inputModelSnapshot.api);
+
+		const rawStreamOptions =
+			inputKind === "native"
+				? (validateNativeCompactionOptions(inputModelSnapshot.api, options ?? {}) as StreamOptions)
+				: cloneStreamOptionsForNative(options);
+		const rawNativeOptions = selectNativeCompactionOptions(inputModelSnapshot.api, rawStreamOptions);
+		if (inputModelSnapshot.api === "openai-codex-responses" && rawOptionProperties.has("apiKey")) {
+			throw createNativeCompactionError("unsupported");
+		}
+		if (hasAuthorizationHeader(rawNativeOptions.headers)) {
+			throw createNativeCompactionError("unsupported");
+		}
+
+		const contextSnapshot = cloneAndFreezeNativeContext(context);
+		const rawProviderContext = readContextProviderContext(context);
+		const providerContext =
+			rawProviderContext === undefined ? undefined : cloneAndFreezeProviderContext(rawProviderContext);
+		let authResult: {
+			requestModel: Model<Api>;
+			requestOptions: StreamOptions | undefined;
+			resolution: AuthResult;
+		};
+		try {
+			authResult = await this.applyAuth(
+				inputModelSnapshot,
+				rawStreamOptions as StreamOptions & ModelsStreamTransforms,
+			);
+		} catch (error) {
+			throwIfNativeCompactionAborted(signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+		const { requestModel, requestOptions, resolution } = authResult;
+		throwIfNativeCompactionAborted(signal);
+		if (
+			inputModelSnapshot.api === "openai-codex-responses" &&
+			(typeof resolution.auth.apiKey !== "string" || resolution.auth.apiKey.length === 0)
+		) {
+			throw createNativeCompactionError("unsupported");
+		}
+		const streamOptions = cloneStreamOptionsForNative(requestOptions, true);
+		const nativeOptions = selectNativeCompactionOptions(inputModelSnapshot.api, streamOptions);
+		if (hasAuthorizationHeader(nativeOptions.headers)) {
+			throw createNativeCompactionError("unsupported");
+		}
+		const modelSnapshot = cloneNativeModel(requestModel as Model<TApi>);
+		const credentialScopeHash = await this.resolveNativeCredentialScope(
+			inputModelSnapshot.api,
+			provider,
+			resolution,
+			nativeOptions,
+			signal,
+		);
+		throwIfNativeCompactionAborted(signal);
+
+		let endpoint: NativeCompactionEndpoint<TApi>;
+		try {
+			endpoint = validateNativeCompactionEndpoint(
+				inputModelSnapshot.api,
+				provider.resolveNativeCompactionEndpoint(modelSnapshot, nativeOptions),
+			);
+		} catch (error) {
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+		const binding: ProviderContextBinding = cloneAndFreezeProviderContext({
+			format: "openai-responses-compaction",
+			version: 1,
+			binding: {
+				provider: provider.id,
+				api: modelSnapshot.api,
+				model: modelSnapshot.id,
+				endpoint: endpoint.endpoint,
+				format: "openai-responses-compaction",
+				protocol: endpoint.protocol,
+				credentialScopeHash,
+			},
+			items: [],
+		}).binding;
+		if (providerContext && !bindingsMatch(providerContext.binding, binding)) {
+			throw createNativeCompactionError("binding_mismatch");
+		}
+
+		const request = Object.freeze({
+			model: modelSnapshot,
+			context: contextSnapshot,
+			options: nativeOptions,
+			binding,
+			...(providerContext ? { providerContext } : {}),
+		}) as unknown as NativeCompactionProviderRequest<TApi>;
+		NATIVE_COMPACTION_PROVIDER_REQUESTS.add(request);
+		const streamContext = Object.freeze({
+			...contextSnapshot,
+			...(providerContext ? { providerContext } : {}),
+		}) as Context;
+		return Object.freeze({ provider, request, streamContext, streamOptions });
+	}
+
+	async compact<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		context: Context,
+		options?: NativeCompactionPublicOptionsMap[TApi],
+	): Promise<NativeCompactionResult> {
+		const preflight = await this.nativeCompactionPreflight(model, context, options, "native");
+		try {
+			const rawResult: unknown = await preflight.provider.compact(preflight.request);
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			let result: NativeCompactionResult;
+			try {
+				result = validateNativeCompactionResult(rawResult);
+			} catch {
+				throw createNativeCompactionError("protocol");
+			}
+			if (!bindingsMatch(result.providerContext.binding, preflight.request.binding)) {
+				throw createNativeCompactionError("binding_mismatch");
+			}
+			return result;
+		} catch (error) {
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+	}
+
+	async canConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: NativeCompactionPublicOptionsMap[TApi],
+	): Promise<boolean> {
+		const preflight = await this.nativeCompactionPreflight(
+			model,
+			{ messages: [], providerContext },
+			options,
+			"native",
+		);
+		try {
+			const result: unknown = await preflight.provider.canConsumeProviderContext(preflight.request);
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			if (typeof result !== "boolean") throw createNativeCompactionError("protocol");
+			return result;
+		} catch (error) {
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
 	}
 
 	stream<TApi extends Api>(
@@ -756,6 +1239,37 @@ class ModelsImpl implements MutableModels {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			const rawProviderContext = readContextProviderContext(context);
+			if (rawProviderContext !== undefined) {
+				const preflight = await this.nativeCompactionPreflight(
+					model as Model<NativeCompactionApi>,
+					context,
+					options,
+					"stream",
+				);
+				let canConsume: unknown;
+				try {
+					canConsume = await preflight.provider.canConsumeProviderContext(preflight.request);
+				} catch (error) {
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					throw sanitizeNativeCompactionError(error, "provider_error");
+				}
+				throwIfNativeCompactionAborted(preflight.request.options.signal);
+				if (typeof canConsume !== "boolean") throw createNativeCompactionError("protocol");
+				if (!canConsume) throw createNativeCompactionError("unsupported");
+				try {
+					const stream = preflight.provider.stream(
+						preflight.request.model,
+						preflight.streamContext,
+						preflight.streamOptions,
+					);
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					return stream;
+				} catch (error) {
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					throw sanitizeNativeCompactionError(error, "provider_error");
+				}
+			}
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(
 				model,
@@ -775,6 +1289,38 @@ class ModelsImpl implements MutableModels {
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			const rawProviderContext = readContextProviderContext(context);
+			if (rawProviderContext !== undefined) {
+				if (!isNativeCompactionApi(model.api)) throw createNativeCompactionError("unsupported");
+				const preflight = await this.nativeCompactionPreflight(
+					model as Model<NativeCompactionApi>,
+					context,
+					options,
+					"stream",
+				);
+				let canConsume: unknown;
+				try {
+					canConsume = await preflight.provider.canConsumeProviderContext(preflight.request);
+				} catch (error) {
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					throw sanitizeNativeCompactionError(error, "provider_error");
+				}
+				throwIfNativeCompactionAborted(preflight.request.options.signal);
+				if (typeof canConsume !== "boolean") throw createNativeCompactionError("protocol");
+				if (!canConsume) throw createNativeCompactionError("unsupported");
+				try {
+					const stream = preflight.provider.streamSimple(
+						preflight.request.model,
+						preflight.streamContext,
+						preflight.streamOptions,
+					);
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					return stream;
+				} catch (error) {
+					throwIfNativeCompactionAborted(preflight.request.options.signal);
+					throw sanitizeNativeCompactionError(error, "provider_error");
+				}
+			}
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
 			return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
@@ -902,6 +1448,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 			try {
 				return await streams.compact(request);
 			} catch (error) {
+				throwIfNativeCompactionAborted(request.options.signal);
 				throw sanitizeNativeCompactionError(error, "provider_error");
 			}
 		},
@@ -914,6 +1461,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 			try {
 				return await streams.canConsumeProviderContext(request);
 			} catch (error) {
+				throwIfNativeCompactionAborted(request.options.signal);
 				throw sanitizeNativeCompactionError(error, "provider_error");
 			}
 		},

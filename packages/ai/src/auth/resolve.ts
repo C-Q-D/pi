@@ -17,8 +17,34 @@ export type ModelsErrorCode = "model_source" | "model_validation" | "provider" |
 export interface AuthResolutionOverrides {
 	apiKey?: string;
 	env?: ProviderEnv;
+	signal?: AbortSignal;
 	/** Require this much remaining OAuth-token validity; defaults to five minutes. */
 	minOAuthValidityMs?: number;
+}
+
+export type EffectiveAuthMetadata =
+	| { readonly kind: "api_key" }
+	| {
+			readonly kind: "oauth";
+			readonly finalCredential: OAuthCredential;
+			readonly previousSubject?:
+				| { readonly status: "resolved"; readonly value: string | undefined }
+				| { readonly status: "error" };
+			readonly getStableSubject?: OAuthAuth["getStableSubject"];
+	  };
+
+const EFFECTIVE_AUTH_METADATA = new WeakMap<AuthResult, EffectiveAuthMetadata>();
+
+/** Internal Models preflight metadata; never serialized with AuthResult. */
+export function getEffectiveAuthMetadata(result: AuthResult): EffectiveAuthMetadata | undefined {
+	return EFFECTIVE_AUTH_METADATA.get(result);
+}
+
+/** Preserve private auth provenance when Models adds model-owned headers. */
+export function inheritEffectiveAuthMetadata(source: AuthResult, target: AuthResult): AuthResult {
+	const metadata = EFFECTIVE_AUTH_METADATA.get(source);
+	if (metadata) EFFECTIVE_AUTH_METADATA.set(target, metadata);
+	return target;
 }
 
 export class ModelsError extends Error {
@@ -70,6 +96,7 @@ export async function resolveProviderAuth(
 				provider.auth.oauth,
 				stored,
 				overrides?.minOAuthValidityMs,
+				overrides?.signal,
 			);
 		}
 		if (stored.type === "api_key" && provider.auth.apiKey) {
@@ -105,20 +132,32 @@ async function resolveStoredOAuth(
 	oauth: OAuthAuth,
 	stored: OAuthCredential,
 	minOAuthValidityMs?: number,
+	signal?: AbortSignal,
 ): Promise<AuthResult | undefined> {
 	const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
 	const expiresSoon = (credential: OAuthCredential) => Date.now() + minimumValidityMs >= credential.expires;
 	let credential = stored;
+	let previousSubject: Extract<EffectiveAuthMetadata, { kind: "oauth" }>["previousSubject"];
 
 	if (expiresSoon(credential)) {
+		if (oauth.getStableSubject) {
+			const initialCredential = snapshotOAuthCredential(credential, providerId);
+			try {
+				previousSubject = { status: "resolved", value: await oauth.getStableSubject(initialCredential) };
+			} catch {
+				previousSubject = { status: "error" };
+			}
+			throwIfAuthResolutionAborted(signal, providerId);
+		}
 		// Optimistic check said expired; the authoritative check runs under the lock.
 		let post: Credential | undefined;
 		try {
 			post = await credentials.modify(providerId, async (current) => {
 				if (current?.type !== "oauth") return undefined; // logged out meanwhile
 				if (!expiresSoon(current)) return undefined; // another process/request refreshed
+				throwIfAuthResolutionAborted(signal, providerId);
 				try {
-					return await oauth.refresh(current);
+					return await oauth.refresh(current, signal);
 				} catch (error) {
 					throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
 				}
@@ -127,6 +166,7 @@ async function resolveStoredOAuth(
 			if (error instanceof ModelsError) throw error;
 			throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
 		}
+		throwIfAuthResolutionAborted(signal, providerId);
 		if (post?.type !== "oauth") return undefined; // logged out meanwhile
 		credential = post;
 		// The normal five-minute window triggers a refresh but does not impose a
@@ -138,10 +178,39 @@ async function resolveStoredOAuth(
 	}
 
 	try {
-		return { auth: await oauth.toAuth(credential), source: "OAuth" };
+		const result: AuthResult = { auth: await oauth.toAuth(credential), source: "OAuth" };
+		EFFECTIVE_AUTH_METADATA.set(result, {
+			kind: "oauth",
+			finalCredential: credential,
+			previousSubject,
+			getStableSubject: oauth.getStableSubject,
+		});
+		return result;
 	} catch (error) {
 		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
 	}
+}
+
+function snapshotOAuthCredential(credential: OAuthCredential, providerId: string): OAuthCredential {
+	try {
+		const serialized = JSON.stringify(credential);
+		if (serialized === undefined) {
+			throw new TypeError("Credential is not serializable");
+		}
+		return deepFreezeCredential(JSON.parse(serialized) as OAuthCredential);
+	} catch (error) {
+		throw new ModelsError("oauth", `OAuth credential snapshot failed for ${providerId}`, { cause: error });
+	}
+}
+
+function deepFreezeCredential<T>(value: T): T {
+	if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value)) deepFreezeCredential(child);
+	return Object.freeze(value);
+}
+
+function throwIfAuthResolutionAborted(signal: AbortSignal | undefined, providerId: string): void {
+	if (signal?.aborted) throw new ModelsError("oauth", `OAuth resolution aborted for ${providerId}`);
 }
 
 async function resolveApiKey(
@@ -151,7 +220,9 @@ async function resolveApiKey(
 	credential: ApiKeyCredential | undefined,
 ): Promise<AuthResult | undefined> {
 	try {
-		return await apiKey.resolve({ ctx: authContext, credential });
+		const result = await apiKey.resolve({ ctx: authContext, credential });
+		if (result) EFFECTIVE_AUTH_METADATA.set(result, { kind: "api_key" });
+		return result;
 	} catch (error) {
 		throw new ModelsError("auth", `API key auth failed for provider ${providerId}`, { cause: error });
 	}
