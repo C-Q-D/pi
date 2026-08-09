@@ -3,7 +3,7 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { openaiCodexOAuth } from "../src/auth/oauth/openai-codex.ts";
 import type { ApiKeyAuth, AuthContext, OAuthAuth } from "../src/auth/types.ts";
-import { assertNativeCompactionProviderRequest, createModels, createProvider, type Models } from "../src/models.ts";
+import { createModels, createProvider, type Models } from "../src/models.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -19,6 +19,10 @@ import type {
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { sha256Hex } from "../src/utils/hash.ts";
 import { NativeCompactionError } from "../src/utils/native-compaction.ts";
+import {
+	assertNativeCompactionProviderRequest,
+	getAuthorizedNativeCompactionBindings,
+} from "../src/utils/native-request.ts";
 
 const authContext: AuthContext = {
 	env: async () => undefined,
@@ -140,9 +144,12 @@ function nativeHarness<TApi extends NativeCompactionApi>(
 			consumerCalls.push(request);
 			return harness.consumerResult.value as boolean;
 		},
-		resolveNativeCompactionEndpoint: () => ({
-			endpoint: harness.endpoint.value,
-			protocol: api === "openai-responses" ? "openai-responses-compact" : "openai-codex-remote-v2",
+		resolveNativeCompactionRoutes: () => ({
+			primary: {
+				endpoint: harness.endpoint.value,
+				protocol: api === "openai-responses" ? "openai-responses-compact" : "openai-codex-remote-v2",
+			},
+			fallbacks: [],
 		}),
 	} as unknown as ProviderStreams<TApi>;
 	const provider = createProvider({
@@ -242,6 +249,70 @@ describe("Models native compaction preflight", () => {
 		expect("details" in request.context.messages[1]!).toBe(false);
 		expect(Reflect.ownKeys(request.context.tools![0]!.parameters)).not.toContain("~kind");
 		expect(result.providerContext.binding).toEqual(request.binding);
+	});
+
+	it("accepts only bindings from the preauthorized route set and keeps one frozen authorization identity", async () => {
+		const model = nativeModel("route-set", "openai-responses");
+		let capturedRequest: NativeCompactionProviderRequest<"openai-responses"> | undefined;
+		let returnUnauthorized = false;
+		const streams: ProviderStreams<"openai-responses"> = {
+			stream: (requestModel) => doneStream(requestModel),
+			streamSimple: (requestModel) => doneStream(requestModel),
+			resolveNativeCompactionRoutes: () => ({
+				primary: {
+					endpoint: "https://api.example.test/v1/responses/compact",
+					protocol: "openai-responses-compact",
+				},
+				fallbacks: [
+					{
+						endpoint: "https://backup.example.test/v1/responses/compact",
+						protocol: "openai-responses-compact",
+					},
+				],
+			}),
+			compact: async (request) => {
+				capturedRequest = request;
+				const bindings = getAuthorizedNativeCompactionBindings(request);
+				return {
+					providerContext: {
+						format: "openai-responses-compaction",
+						version: 1,
+						binding: returnUnauthorized
+							? { ...bindings[1]!, endpoint: "https://unauthorized.example.test/v1/compact" }
+							: bindings[1]!,
+						items: [{ type: "compaction", encrypted_content: "opaque" }],
+					},
+				};
+			},
+			canConsumeProviderContext: async (request) => {
+				const bindings = getAuthorizedNativeCompactionBindings(request);
+				return request.providerContext?.binding.endpoint === bindings[1]?.endpoint;
+			},
+		};
+		const provider = createProvider({
+			id: "route-set",
+			auth: { apiKey: apiKeyAuth },
+			models: [model],
+			api: streams,
+		});
+		const models = createModels({ authContext });
+		models.setProvider(provider);
+
+		const compacted = await models.compact(model, { messages: [] });
+		const request = capturedRequest!;
+		const firstRead = getAuthorizedNativeCompactionBindings(request);
+		expect(getAuthorizedNativeCompactionBindings(request)).toBe(firstRead);
+		expect(request.binding).toBe(firstRead[0]);
+		expect(Object.isFrozen(firstRead)).toBe(true);
+		expect(firstRead.every(Object.isFrozen)).toBe(true);
+		expect(compacted.providerContext.binding).toEqual(firstRead[1]);
+		expect(await models.canConsumeProviderContext(model, compacted.providerContext)).toBe(true);
+
+		returnUnauthorized = true;
+		await expect(models.compact(model, { messages: [] })).rejects.toSatisfy((error) => {
+			expectNativeCode(error, "binding_mismatch");
+			return true;
+		});
 	});
 
 	it("snapshots model, context and options before asynchronous auth finishes", async () => {

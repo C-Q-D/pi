@@ -22,7 +22,7 @@ function loadNodeOs(): typeof NodeOs | null {
 const _os: typeof NodeOs | null = loadNodeOs();
 
 import { parseOpenAICodexAccountId } from "../auth/oauth/openai-codex-jwt.ts";
-import { assertNativeCompactionProviderRequest, clampThinkingLevel } from "../models.ts";
+import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
 	Api,
@@ -58,14 +58,12 @@ import {
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
 } from "../utils/native-compaction.ts";
+import { assertNativeCompactionProviderRequest } from "../utils/native-request.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
-import {
-	resolveOpenAICodexCompactionEndpoint,
-	resolveOpenAICodexResponsesUrl,
-} from "./openai-codex-responses-shared.ts";
+import { resolveOpenAICodexCompactionRoutes, resolveOpenAICodexResponsesUrl } from "./openai-codex-responses-shared.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -874,7 +872,7 @@ function buildCodexCompactionPayload(
 	return projectNativeCodexPayload(body, request.model.id, prefix, true);
 }
 
-export const resolveNativeCompactionEndpoint = resolveOpenAICodexCompactionEndpoint;
+export const resolveNativeCompactionRoutes = resolveOpenAICodexCompactionRoutes;
 
 /** Models Preflight 后登记一次性 Replay Handoff。 */
 export async function canConsumeProviderContext(
@@ -896,8 +894,11 @@ export async function compact(
 	assertNativeCompactionProviderRequest(request);
 	try {
 		throwIfNativeCompactionAborted(request.options.signal);
-		const endpoint = resolveOpenAICodexCompactionEndpoint(request.model, request.options);
-		if (endpoint.endpoint !== request.binding.endpoint || endpoint.protocol !== request.binding.protocol) {
+		const routes = resolveOpenAICodexCompactionRoutes(request.model, request.options);
+		if (
+			routes.primary.endpoint !== request.binding.endpoint ||
+			routes.primary.protocol !== request.binding.protocol
+		) {
 			throw createNativeCompactionError("binding_mismatch");
 		}
 		const prefix = request.providerContext ? validateCodexCanonicalItems(request.providerContext.items) : [];

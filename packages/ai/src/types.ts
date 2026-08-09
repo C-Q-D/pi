@@ -269,6 +269,12 @@ export interface NativeCompactionEndpoint<TApi extends NativeCompactionApi = Nat
 	readonly protocol: NativeCompactionProtocolMap[TApi];
 }
 
+/** Adapter 在发网前一次性声明并冻结的原生压缩 Route 集合。 */
+export interface NativeCompactionRouteSet<TApi extends NativeCompactionApi = NativeCompactionApi> {
+	readonly primary: NativeCompactionEndpoint<TApi>;
+	readonly fallbacks: readonly NativeCompactionEndpoint<TApi>[];
+}
+
 declare const nativeCompactionProviderRequestBrand: unique symbol;
 
 /** 只能由 Models Preflight 创建并在运行时登记的 Provider 请求。 */
@@ -286,17 +292,17 @@ export interface NativeCompactionProviderRequest<TApi extends NativeCompactionAp
 export interface NativeCompactionProviderCapabilities<TApi extends NativeCompactionApi = NativeCompactionApi> {
 	readonly compact: (request: NativeCompactionProviderRequest<TApi>) => Promise<NativeCompactionResult>;
 	readonly canConsumeProviderContext: (request: NativeCompactionProviderRequest<TApi>) => Promise<boolean>;
-	readonly resolveNativeCompactionEndpoint: (
+	readonly resolveNativeCompactionRoutes: (
 		model: Readonly<Model<TApi>>,
 		options: Readonly<NativeCompactionPublicOptionsMap[TApi]>,
-	) => NativeCompactionEndpoint<TApi>;
+	) => NativeCompactionRouteSet<TApi>;
 }
 
 /** 显式禁止只实现原生压缩三件套中的一部分。 */
 export interface NoNativeCompactionProviderCapabilities {
 	readonly compact?: undefined;
 	readonly canConsumeProviderContext?: undefined;
-	readonly resolveNativeCompactionEndpoint?: undefined;
+	readonly resolveNativeCompactionRoutes?: undefined;
 }
 
 /** 根据 Provider 的 API 集合计算可用的原生压缩 API。 */

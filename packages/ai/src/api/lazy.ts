@@ -1,11 +1,9 @@
-import { assertNativeCompactionProviderRequest } from "../models.ts";
 import type {
 	NativeCompactionApi,
-	NativeCompactionEndpoint,
 	NativeCompactionProviderCapabilities,
 	NativeCompactionProviderRequest,
 	NativeCompactionResult,
-	ProviderContextBinding,
+	NativeCompactionRouteSet,
 	ProviderStreamMethods,
 	ProviderStreams,
 } from "../types.ts";
@@ -15,7 +13,12 @@ import {
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
 } from "../utils/native-compaction.ts";
-import { assertNativeCompactionApi, validateNativeCompactionEndpoint } from "../utils/native-endpoint.ts";
+import { assertNativeCompactionApi, validateNativeCompactionRouteSet } from "../utils/native-endpoint.ts";
+import {
+	assertAuthorizedNativeCompactionBinding,
+	assertNativeCompactionProviderRequest,
+	getAuthorizedNativeCompactionBindings,
+} from "../utils/native-request.ts";
 
 export { lazyStream } from "../utils/lazy-stream.ts";
 
@@ -23,7 +26,7 @@ type NativeStreamsRuntime = ProviderStreamMethods & Partial<NativeCompactionProv
 
 export interface LazyNativeCompactionOptions<TApi extends NativeCompactionApi> {
 	readonly nativeCompaction: {
-		readonly resolveNativeCompactionEndpoint: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionEndpoint"];
+		readonly resolveNativeCompactionRoutes: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionRoutes"];
 	};
 }
 
@@ -35,7 +38,7 @@ function hasNativeCompactionCapabilities(
 	return (
 		typeof candidate.compact === "function" &&
 		typeof candidate.canConsumeProviderContext === "function" &&
-		typeof candidate.resolveNativeCompactionEndpoint === "function"
+		typeof candidate.resolveNativeCompactionRoutes === "function"
 	);
 }
 
@@ -43,20 +46,17 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw createNativeCompactionError("aborted");
 }
 
-function bindingsMatch(left: ProviderContextBinding, right: ProviderContextBinding): boolean {
+function routesMatchRequest(routes: NativeCompactionRouteSet, request: NativeCompactionProviderRequest): boolean {
+	const authorizedBindings = getAuthorizedNativeCompactionBindings(request);
+	const resolvedRoutes = [routes.primary, ...routes.fallbacks];
 	return (
-		left.provider === right.provider &&
-		left.api === right.api &&
-		left.model === right.model &&
-		left.endpoint === right.endpoint &&
-		left.format === right.format &&
-		left.protocol === right.protocol &&
-		left.credentialScopeHash === right.credentialScopeHash
+		resolvedRoutes.length === authorizedBindings.length &&
+		resolvedRoutes.every(
+			(route, index) =>
+				route.endpoint === authorizedBindings[index]?.endpoint &&
+				route.protocol === authorizedBindings[index]?.protocol,
+		)
 	);
-}
-
-function endpointMatchesRequest(endpoint: NativeCompactionEndpoint, request: NativeCompactionProviderRequest): boolean {
-	return endpoint.endpoint === request.binding.endpoint && endpoint.protocol === request.binding.protocol;
 }
 
 async function loadNativeStreams(
@@ -73,30 +73,30 @@ async function loadNativeStreams(
 	}
 	throwIfAborted(request.options.signal);
 	if (!hasNativeCompactionCapabilities(streams)) throw createNativeCompactionError("unsupported");
-	let endpoint: NativeCompactionEndpoint;
+	let routes: NativeCompactionRouteSet;
 	try {
-		endpoint = validateNativeCompactionEndpoint(
+		routes = validateNativeCompactionRouteSet(
 			request.model.api,
-			streams.resolveNativeCompactionEndpoint(request.model, request.options),
+			streams.resolveNativeCompactionRoutes(request.model, request.options),
 		);
 	} catch (error) {
 		throwIfAborted(request.options.signal);
 		throw sanitizeNativeCompactionError(error, "provider_error");
 	}
 	throwIfAborted(request.options.signal);
-	if (!endpointMatchesRequest(endpoint, request)) throw createNativeCompactionError("binding_mismatch");
+	if (!routesMatchRequest(routes, request)) throw createNativeCompactionError("binding_mismatch");
 	return streams;
 }
 
 function createNativeCapabilities<TApi extends NativeCompactionApi>(
 	load: () => Promise<NativeStreamsRuntime>,
-	resolver: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionEndpoint"],
+	resolver: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionRoutes"],
 ): NativeCompactionProviderCapabilities<TApi> {
 	return {
-		resolveNativeCompactionEndpoint: (model, options) => {
+		resolveNativeCompactionRoutes: (model, options) => {
 			try {
 				assertNativeCompactionApi(model.api);
-				return validateNativeCompactionEndpoint(model.api, resolver(model, options));
+				return validateNativeCompactionRouteSet(model.api, resolver(model, options));
 			} catch (error) {
 				throw sanitizeNativeCompactionError(error, "provider_error");
 			}
@@ -114,9 +114,7 @@ function createNativeCapabilities<TApi extends NativeCompactionApi>(
 				} catch {
 					throw createNativeCompactionError("protocol");
 				}
-				if (!bindingsMatch(result.providerContext.binding, request.binding)) {
-					throw createNativeCompactionError("binding_mismatch");
-				}
+				assertAuthorizedNativeCompactionBinding(request, result.providerContext.binding);
 				return result;
 			} catch (error) {
 				throwIfAborted(request.options.signal);
@@ -163,6 +161,6 @@ export function lazyApi<TApi extends NativeCompactionApi>(
 	if (!options) return streams;
 	return Object.assign(
 		streams,
-		createNativeCapabilities(load, options.nativeCompaction.resolveNativeCompactionEndpoint),
+		createNativeCapabilities(load, options.nativeCompaction.resolveNativeCompactionRoutes),
 	);
 }

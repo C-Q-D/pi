@@ -20,8 +20,8 @@ import type {
 	Context,
 	ImageContent,
 	Model,
-	NativeCompactionEndpoint,
 	NativeCompactionPublicOptionsMap,
+	NativeCompactionRouteSet,
 	StopReason,
 	TextContent,
 	TextSignatureV1,
@@ -34,7 +34,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { createNativeCompactionError } from "../utils/native-compaction.ts";
-import { validateNativeCompactionEndpoint } from "../utils/native-endpoint.ts";
+import { validateNativeCompactionRouteSet } from "../utils/native-endpoint.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import {
 	appendGrammarToolInputJsonDelta,
@@ -49,16 +49,19 @@ import { transformMessages } from "./transform-messages.ts";
 // Utilities
 // =============================================================================
 
-/** Resolve the stable Public Responses compaction endpoint without loading the OpenAI SDK. */
-export function resolveOpenAIResponsesCompactionEndpoint(
+/** Resolve the stable Public Responses compaction route set without loading the OpenAI SDK. */
+export function resolveOpenAIResponsesCompactionRoutes(
 	model: Readonly<Model<"openai-responses">>,
 	_options: Readonly<NativeCompactionPublicOptionsMap["openai-responses"]>,
-): NativeCompactionEndpoint<"openai-responses"> {
+): NativeCompactionRouteSet<"openai-responses"> {
 	try {
 		if (model.baseUrl.includes("?")) throw createNativeCompactionError("protocol");
-		return validateNativeCompactionEndpoint("openai-responses", {
-			endpoint: model.baseUrl,
-			protocol: "openai-responses-compact",
+		return validateNativeCompactionRouteSet("openai-responses", {
+			primary: {
+				endpoint: model.baseUrl,
+				protocol: "openai-responses-compact",
+			},
+			fallbacks: [],
 		});
 	} catch {
 		throw createNativeCompactionError("protocol");

@@ -8,7 +8,7 @@ import {
 	registerApiProvider,
 	resetApiProviders,
 } from "../src/compat.ts";
-import { assertNativeCompactionProviderRequest, createModels, createProvider } from "../src/models.ts";
+import { createModels, createProvider } from "../src/models.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -20,6 +20,7 @@ import type {
 } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { NativeCompactionError } from "../src/utils/native-compaction.ts";
+import { assertNativeCompactionProviderRequest } from "../src/utils/native-request.ts";
 
 const authContext = {
 	env: async (): Promise<string | undefined> => undefined,
@@ -83,6 +84,7 @@ interface LazyHarness {
 	stream: ReturnType<typeof vi.fn>;
 	state: {
 		endpoint: string;
+		moduleFallbackEndpoint?: string;
 		compactResult?: unknown;
 		consumerResult: unknown;
 	};
@@ -97,8 +99,10 @@ function createLazyHarness(): LazyHarness {
 	const capturedRequests: NativeCompactionProviderRequest<"openai-responses">[] = [];
 	const stream = vi.fn((requestModel: Model<Api>) => doneStream(requestModel));
 	const moduleResolver = vi.fn(() => ({
-		endpoint: state.endpoint,
-		protocol: "openai-responses-compact" as const,
+		primary: { endpoint: state.endpoint, protocol: "openai-responses-compact" as const },
+		fallbacks: state.moduleFallbackEndpoint
+			? [{ endpoint: state.moduleFallbackEndpoint, protocol: "openai-responses-compact" as const }]
+			: [],
 	}));
 	const compact = vi.fn(async (request: NativeCompactionProviderRequest<"openai-responses">) => {
 		assertNativeCompactionProviderRequest(request);
@@ -122,14 +126,17 @@ function createLazyHarness(): LazyHarness {
 		streamSimple: stream,
 		compact,
 		canConsumeProviderContext: consumer,
-		resolveNativeCompactionEndpoint: moduleResolver,
+		resolveNativeCompactionRoutes: moduleResolver,
 	};
 	const load = vi.fn(async () => module);
 	const publicResolver = vi.fn(() => ({
-		endpoint: "https://api.example.test/v1/responses?mode=compact",
-		protocol: "openai-responses-compact" as const,
+		primary: {
+			endpoint: "https://api.example.test/v1/responses?mode=compact",
+			protocol: "openai-responses-compact" as const,
+		},
+		fallbacks: [],
 	}));
-	const lazy = lazyApi(load, { nativeCompaction: { resolveNativeCompactionEndpoint: publicResolver } });
+	const lazy = lazyApi(load, { nativeCompaction: { resolveNativeCompactionRoutes: publicResolver } });
 	return { lazy, load, publicResolver, moduleResolver, compact, consumer, stream, state, capturedRequests };
 }
 
@@ -198,7 +205,7 @@ describe("native compaction lazy boundary", () => {
 		});
 		let caught: unknown;
 		try {
-			harness.lazy.resolveNativeCompactionEndpoint(
+			harness.lazy.resolveNativeCompactionRoutes(
 				{ ...model, api: "not-native" } as unknown as Model<"openai-responses">,
 				{},
 			);
@@ -233,6 +240,17 @@ describe("native compaction lazy boundary", () => {
 	it("rejects endpoint drift before invoking the underlying capability", async () => {
 		const harness = createLazyHarness();
 		harness.state.endpoint = "https://different.example.test/v1/responses";
+		const models = createNativeModels(harness);
+		await expect(models.compact(model, { messages: [] })).rejects.toSatisfy((error) => {
+			expectNativeCode(error, "binding_mismatch");
+			return true;
+		});
+		expect(harness.compact).not.toHaveBeenCalled();
+	});
+
+	it("rejects fallback route-set drift before invoking the underlying capability", async () => {
+		const harness = createLazyHarness();
+		harness.state.moduleFallbackEndpoint = "https://backup.example.test/v1/responses";
 		const models = createNativeModels(harness);
 		await expect(models.compact(model, { messages: [] })).rejects.toSatisfy((error) => {
 			expectNativeCode(error, "binding_mismatch");

@@ -192,7 +192,7 @@ describe("OpenAI Codex Remote Compaction V2", () => {
 		expectTypeOf<CompactRequest>().toEqualTypeOf<NativeCompactionProviderRequest<"openai-codex-responses">>();
 		expect(lazy.compact).toBeTypeOf("function");
 		expect(lazy.canConsumeProviderContext).toBeTypeOf("function");
-		expect(lazy.resolveNativeCompactionEndpoint).toBeTypeOf("function");
+		expect(lazy.resolveNativeCompactionRoutes).toBeTypeOf("function");
 	});
 
 	it("sends the exact V2 request and accepts unrelated output items", async () => {

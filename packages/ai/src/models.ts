@@ -28,11 +28,11 @@ import type {
 	ModelCostRates,
 	ModelThinkingLevel,
 	NativeCompactionApi,
-	NativeCompactionEndpoint,
 	NativeCompactionProviderCapabilities,
 	NativeCompactionProviderRequest,
 	NativeCompactionPublicOptionsMap,
 	NativeCompactionResult,
+	NativeCompactionRouteSet,
 	NoNativeCompactionProviderCapabilities,
 	OptionalNativeCompactionProviderCapabilities,
 	ProviderContextBinding,
@@ -54,7 +54,13 @@ import {
 	validateNativeCompactionResult,
 } from "./utils/native-compaction.ts";
 import { cloneAndFreezeNativeContext } from "./utils/native-context.ts";
-import { validateNativeCompactionEndpoint } from "./utils/native-endpoint.ts";
+import { validateNativeCompactionRouteSet } from "./utils/native-endpoint.ts";
+import {
+	assertAuthorizedNativeCompactionBinding,
+	assertNativeCompactionProviderRequest,
+	nativeCompactionBindingIsAuthorized,
+	registerNativeCompactionProviderRequest,
+} from "./utils/native-request.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -150,7 +156,7 @@ interface ProviderCore<TApi extends Api = Api> {
 interface ErasedNativeCompactionProviderCapabilities {
 	readonly compact: (request: never) => Promise<NativeCompactionResult>;
 	readonly canConsumeProviderContext: (request: never) => Promise<boolean>;
-	readonly resolveNativeCompactionEndpoint: (model: never, options: never) => NativeCompactionEndpoint;
+	readonly resolveNativeCompactionRoutes: (model: never, options: never) => NativeCompactionRouteSet;
 }
 
 type OptionalErasedNativeCompactionProviderCapabilities =
@@ -298,7 +304,6 @@ const NATIVE_COMPACTION_COMMON_OPTION_KEYS = [
 ] as const;
 const OPENAI_RESPONSES_NATIVE_OPTION_KEYS = new Set<string>(NATIVE_COMPACTION_COMMON_OPTION_KEYS);
 const OPENAI_CODEX_NATIVE_OPTION_KEYS = new Set<string>([...NATIVE_COMPACTION_COMMON_OPTION_KEYS, "textVerbosity"]);
-const NATIVE_COMPACTION_PROVIDER_REQUESTS = new WeakSet<object>();
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -458,7 +463,7 @@ function hasNativeCompactionCapabilities(
 	return (
 		typeof streams.compact === "function" &&
 		typeof streams.canConsumeProviderContext === "function" &&
-		typeof streams.resolveNativeCompactionEndpoint === "function"
+		typeof streams.resolveNativeCompactionRoutes === "function"
 	);
 }
 
@@ -467,20 +472,8 @@ function hasAnyNativeCompactionCapability(streams: ProviderStreamsRuntime): bool
 	return (
 		typeof streams.compact === "function" ||
 		typeof streams.canConsumeProviderContext === "function" ||
-		typeof streams.resolveNativeCompactionEndpoint === "function"
+		typeof streams.resolveNativeCompactionRoutes === "function"
 	);
-}
-
-/**
- * 断言请求已由 Models Preflight 登记。
- *
- * 该函数只开放检查能力，不开放 WeakSet 登记能力；公开 raw Adapter 的 Native
- * 方法必须在读取请求或发网前调用它。
- */
-export function assertNativeCompactionProviderRequest(request: NativeCompactionProviderRequest): void {
-	if (!NATIVE_COMPACTION_PROVIDER_REQUESTS.has(request)) {
-		throw createNativeCompactionError("unsupported");
-	}
 }
 
 type NarrowedNativeProvider<TApi extends NativeCompactionApi> = ProviderCore<TApi> &
@@ -683,18 +676,6 @@ function readContextProviderContext(context: unknown): unknown {
 	} catch (error) {
 		throw sanitizeNativeCompactionError(error, "invalid_context");
 	}
-}
-
-function bindingsMatch(left: ProviderContextBinding, right: ProviderContextBinding): boolean {
-	return (
-		left.provider === right.provider &&
-		left.api === right.api &&
-		left.model === right.model &&
-		left.endpoint === right.endpoint &&
-		left.format === right.format &&
-		left.protocol === right.protocol &&
-		left.credentialScopeHash === right.credentialScopeHash
-	);
 }
 
 class ModelsImpl implements MutableModels {
@@ -1102,30 +1083,35 @@ class ModelsImpl implements MutableModels {
 		);
 		throwIfNativeCompactionAborted(signal);
 
-		let endpoint: NativeCompactionEndpoint<TApi>;
+		let routes: NativeCompactionRouteSet<TApi>;
 		try {
-			endpoint = validateNativeCompactionEndpoint(
+			routes = validateNativeCompactionRouteSet(
 				inputModelSnapshot.api,
-				provider.resolveNativeCompactionEndpoint(modelSnapshot, nativeOptions),
+				provider.resolveNativeCompactionRoutes(modelSnapshot, nativeOptions),
 			);
 		} catch (error) {
 			throw sanitizeNativeCompactionError(error, "provider_error");
 		}
-		const binding: ProviderContextBinding = cloneAndFreezeProviderContext({
-			format: "openai-responses-compaction",
-			version: 1,
-			binding: {
-				provider: provider.id,
-				api: modelSnapshot.api,
-				model: modelSnapshot.id,
-				endpoint: endpoint.endpoint,
-				format: "openai-responses-compaction",
-				protocol: endpoint.protocol,
-				credentialScopeHash,
-			},
-			items: [],
-		}).binding;
-		if (providerContext && !bindingsMatch(providerContext.binding, binding)) {
+		const authorizedBindings = Object.freeze(
+			[routes.primary, ...routes.fallbacks].map(
+				(route): ProviderContextBinding =>
+					cloneAndFreezeProviderContext({
+						format: "openai-responses-compaction",
+						version: 1,
+						binding: {
+							provider: provider.id,
+							api: modelSnapshot.api,
+							model: modelSnapshot.id,
+							endpoint: route.endpoint,
+							format: "openai-responses-compaction",
+							protocol: route.protocol,
+							credentialScopeHash,
+						},
+						items: [],
+					}).binding,
+			),
+		);
+		if (providerContext && !nativeCompactionBindingIsAuthorized(providerContext.binding, authorizedBindings)) {
 			throw createNativeCompactionError("binding_mismatch");
 		}
 
@@ -1133,10 +1119,10 @@ class ModelsImpl implements MutableModels {
 			model: modelSnapshot,
 			context: contextSnapshot,
 			options: nativeOptions,
-			binding,
+			binding: authorizedBindings[0]!,
 			...(providerContext ? { providerContext } : {}),
 		}) as unknown as NativeCompactionProviderRequest<TApi>;
-		NATIVE_COMPACTION_PROVIDER_REQUESTS.add(request);
+		registerNativeCompactionProviderRequest(request, authorizedBindings);
 		const streamContext = Object.freeze({
 			...contextSnapshot,
 			...(providerContext ? { providerContext } : {}),
@@ -1159,9 +1145,7 @@ class ModelsImpl implements MutableModels {
 			} catch {
 				throw createNativeCompactionError("protocol");
 			}
-			if (!bindingsMatch(result.providerContext.binding, preflight.request.binding)) {
-				throw createNativeCompactionError("binding_mismatch");
-			}
+			assertAuthorizedNativeCompactionBinding(preflight.request, result.providerContext.binding);
 			return result;
 		} catch (error) {
 			throwIfNativeCompactionAborted(preflight.request.options.signal);
@@ -1404,7 +1388,15 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 				throw createNativeCompactionError("unsupported");
 			}
 			try {
-				return await streams.compact(request);
+				const rawResult: unknown = await streams.compact(request);
+				let result: NativeCompactionResult;
+				try {
+					result = validateNativeCompactionResult(rawResult);
+				} catch {
+					throw createNativeCompactionError("protocol");
+				}
+				assertAuthorizedNativeCompactionBinding(request, result.providerContext.binding);
+				return result;
 			} catch (error) {
 				throwIfNativeCompactionAborted(request.options.signal);
 				throw sanitizeNativeCompactionError(error, "provider_error");
@@ -1423,7 +1415,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 				throw sanitizeNativeCompactionError(error, "provider_error");
 			}
 		},
-		resolveNativeCompactionEndpoint: (model, options): NativeCompactionEndpoint => {
+		resolveNativeCompactionRoutes: (model, options): NativeCompactionRouteSet => {
 			try {
 				if (!isNativeCompactionApi(model.api)) {
 					throw createNativeCompactionError("unsupported");
@@ -1433,9 +1425,9 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 					throw createNativeCompactionError("unsupported");
 				}
 				const validatedOptions = validateNativeCompactionOptions(model.api, options);
-				return validateNativeCompactionEndpoint(
+				return validateNativeCompactionRouteSet(
 					model.api,
-					streams.resolveNativeCompactionEndpoint(model, validatedOptions),
+					streams.resolveNativeCompactionRoutes(model, validatedOptions),
 				);
 			} catch (error) {
 				throw sanitizeNativeCompactionError(error, "provider_error");

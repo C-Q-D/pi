@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { ResponseCompactParams, ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
-import { assertNativeCompactionProviderRequest, clampThinkingLevel } from "../models.ts";
+import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -33,6 +33,7 @@ import {
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
 } from "../utils/native-compaction.ts";
+import { assertNativeCompactionProviderRequest } from "../utils/native-request.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
@@ -42,7 +43,7 @@ import {
 	convertResponsesMessages,
 	convertResponsesTools,
 	processResponsesStream,
-	resolveOpenAIResponsesCompactionEndpoint,
+	resolveOpenAIResponsesCompactionRoutes,
 } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
@@ -389,7 +390,7 @@ function buildCompactionPayload(
 	);
 }
 
-export const resolveNativeCompactionEndpoint = resolveOpenAIResponsesCompactionEndpoint;
+export const resolveNativeCompactionRoutes = resolveOpenAIResponsesCompactionRoutes;
 
 export async function canConsumeProviderContext(
 	request: NativeCompactionProviderRequest<"openai-responses">,

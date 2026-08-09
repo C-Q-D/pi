@@ -1,7 +1,8 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { envApiKeyAuth } from "../src/auth/helpers.ts";
 import type { AuthContext, AuthEvent } from "../src/auth/types.ts";
-import { assertNativeCompactionProviderRequest, createModels, createProvider, type Provider } from "../src/models.ts";
+import * as publicApi from "../src/index.ts";
+import { createModels, createProvider, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import { builtinModels, builtinProviders, getBuiltinModel } from "../src/providers/all.ts";
 import { amazonBedrockProvider } from "../src/providers/amazon-bedrock.ts";
@@ -22,6 +23,7 @@ import type {
 } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { createNativeCompactionError, NativeCompactionError } from "../src/utils/native-compaction.ts";
+import { assertNativeCompactionProviderRequest } from "../src/utils/native-request.ts";
 
 function fakeAuthContext(env: Record<string, string>, files: string[] = []): AuthContext {
 	return {
@@ -304,6 +306,13 @@ describe("envApiKeyAuth", () => {
 });
 
 describe("createProvider", () => {
+	it("不从 Package Barrel 暴露原生请求品牌和授权内部能力", () => {
+		expect("assertNativeCompactionProviderRequest" in publicApi).toBe(false);
+		expect("getAuthorizedNativeCompactionBindings" in publicApi).toBe(false);
+		expect("assertAuthorizedNativeCompactionBinding" in publicApi).toBe(false);
+		expect("registerNativeCompactionProviderRequest" in publicApi).toBe(false);
+	});
+
 	function recordingStreams(label: string, calls: string[]): ProviderStreams {
 		const respond = (model: Model<Api>) => {
 			calls.push(`${label}:${model.id}`);
@@ -339,7 +348,7 @@ describe("createProvider", () => {
 
 	/** 创建完整原生压缩三件套；网络能力在本 Atom 中保持不可执行。 */
 	function nativeStreams<TApi extends NativeCompactionApi>(
-		resolveNativeCompactionEndpoint: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionEndpoint"],
+		resolveNativeCompactionRoutes: NativeCompactionProviderCapabilities<TApi>["resolveNativeCompactionRoutes"],
 	) {
 		return {
 			...recordingStreams("native", []),
@@ -347,7 +356,7 @@ describe("createProvider", () => {
 				throw createNativeCompactionError("provider_error");
 			},
 			canConsumeProviderContext: async () => false,
-			resolveNativeCompactionEndpoint,
+			resolveNativeCompactionRoutes,
 		};
 	}
 
@@ -481,7 +490,10 @@ describe("createProvider", () => {
 			models: [model],
 			api: nativeStreams<"openai-responses">((_model, options) => {
 				capturedOptions = options;
-				return { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" };
+				return {
+					primary: { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" },
+					fallbacks: [],
+				};
 			}),
 		});
 		const controller = new AbortController();
@@ -510,9 +522,9 @@ describe("createProvider", () => {
 
 		expect(provider.compact).toBeTypeOf("function");
 		expect(provider.canConsumeProviderContext).toBeTypeOf("function");
-		expect(provider.resolveNativeCompactionEndpoint?.(model, options)).toEqual({
-			endpoint: "https://api.openai.test/v1",
-			protocol: "openai-responses-compact",
+		expect(provider.resolveNativeCompactionRoutes?.(model, options)).toEqual({
+			primary: { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" },
+			fallbacks: [],
 		});
 		expect(capturedOptions).not.toBe(options);
 		expect(Object.isFrozen(capturedOptions)).toBe(true);
@@ -529,6 +541,66 @@ describe("createProvider", () => {
 		expect(Object.isFrozen(controller.signal)).toBe(false);
 	});
 
+	it("严格复制、冻结并闭合校验 Route Set", () => {
+		const model = testNativeModel("openai-responses", "gpt-test");
+		const rawRoutes = {
+			primary: { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" as const },
+			fallbacks: [{ endpoint: "https://backup.openai.test/v1", protocol: "openai-responses-compact" as const }],
+		};
+		const provider = createProvider({
+			id: "mixed",
+			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+			models: [model],
+			api: nativeStreams<"openai-responses">(() => rawRoutes),
+		});
+
+		const routes = provider.resolveNativeCompactionRoutes?.(model, {});
+		if (!routes) expect.unreachable("完整 Native Provider 必须暴露 Route Set Resolver");
+		rawRoutes.primary.endpoint = "https://mutated.test/v1";
+		rawRoutes.fallbacks[0]!.endpoint = "https://mutated-backup.test/v1";
+		expect(routes).toEqual({
+			primary: { endpoint: "https://api.openai.test/v1", protocol: "openai-responses-compact" },
+			fallbacks: [{ endpoint: "https://backup.openai.test/v1", protocol: "openai-responses-compact" }],
+		});
+		expect(Object.isFrozen(routes)).toBe(true);
+		expect(Object.isFrozen(routes.primary)).toBe(true);
+		expect(Object.isFrozen(routes.fallbacks)).toBe(true);
+		expect(Object.isFrozen(routes.fallbacks[0])).toBe(true);
+
+		let accessorReads = 0;
+		const accessorFallbacks: unknown[] = [];
+		Object.defineProperty(accessorFallbacks, "0", {
+			enumerable: true,
+			get: () => {
+				accessorReads++;
+				return rawRoutes.primary;
+			},
+		});
+		accessorFallbacks.length = 1;
+		const sparseFallbacks = new Array(1);
+		const symbolRoute = { endpoint: "https://symbol.test/v1", protocol: "openai-responses-compact" };
+		Object.defineProperty(symbolRoute, Symbol("hidden"), { value: true, enumerable: true });
+		const invalidRouteSets: unknown[] = [
+			{ primary: rawRoutes.primary },
+			{ primary: rawRoutes.primary, fallbacks: [], extra: true },
+			{ primary: rawRoutes.primary, fallbacks: [rawRoutes.primary] },
+			{ primary: rawRoutes.primary, fallbacks: sparseFallbacks },
+			{ primary: rawRoutes.primary, fallbacks: accessorFallbacks },
+			{ primary: symbolRoute, fallbacks: [] },
+			{ primary: { endpoint: "/relative", protocol: "openai-responses-compact" }, fallbacks: [] },
+		];
+		for (const invalidRoutes of invalidRouteSets) {
+			const invalidProvider = createProvider({
+				id: "mixed",
+				auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+				models: [model],
+				api: nativeStreams<"openai-responses">(() => invalidRoutes as never),
+			});
+			captureProviderNativeError(() => invalidProvider.resolveNativeCompactionRoutes?.(model, {}), "protocol");
+		}
+		expect(accessorReads).toBe(0);
+	});
+
 	it("让 Codex 使用独立 Options 值域，不向 OpenAI Public 借用", () => {
 		const model = testNativeModel("openai-codex-responses", "codex-test");
 		let capturedOptions: Readonly<NativeCompactionPublicOptionsMap["openai-codex-responses"]> | undefined;
@@ -538,11 +610,17 @@ describe("createProvider", () => {
 			models: [model],
 			api: nativeStreams<"openai-codex-responses">((_model, options) => {
 				capturedOptions = options;
-				return { endpoint: "https://chatgpt.test/backend-api/codex", protocol: "openai-codex-remote-v2" };
+				return {
+					primary: {
+						endpoint: "https://chatgpt.test/backend-api/codex",
+						protocol: "openai-codex-remote-v2",
+					},
+					fallbacks: [],
+				};
 			}),
 		});
 
-		provider.resolveNativeCompactionEndpoint?.(model, {
+		provider.resolveNativeCompactionRoutes?.(model, {
 			reasoningEffort: "none",
 			reasoningSummary: "off",
 			textVerbosity: "high",
@@ -575,19 +653,22 @@ describe("createProvider", () => {
 			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
 			models: [model],
 			api: nativeStreams<typeof api>((_model) => ({
-				endpoint: "https://example.test/native",
-				protocol: api === "openai-responses" ? "openai-responses-compact" : "openai-codex-remote-v2",
+				primary: {
+					endpoint: "https://example.test/native",
+					protocol: api === "openai-responses" ? "openai-responses-compact" : "openai-codex-remote-v2",
+				},
+				fallbacks: [],
 			})),
 		});
 
 		expect(() =>
-			provider.resolveNativeCompactionEndpoint?.(
+			provider.resolveNativeCompactionRoutes?.(
 				model,
 				unsafeOptions as unknown as NativeCompactionPublicOptionsMap[typeof api],
 			),
 		).toThrowError(NativeCompactionError);
 		try {
-			provider.resolveNativeCompactionEndpoint?.(
+			provider.resolveNativeCompactionRoutes?.(
 				model,
 				unsafeOptions as unknown as NativeCompactionPublicOptionsMap[typeof api],
 			);
@@ -611,11 +692,11 @@ describe("createProvider", () => {
 			models: [nativeModel],
 			api: partialStreams,
 		});
-		expect(() => partialProvider.resolveNativeCompactionEndpoint?.(nativeModel, {})).toThrowError(
+		expect(() => partialProvider.resolveNativeCompactionRoutes?.(nativeModel, {})).toThrowError(
 			NativeCompactionError,
 		);
 		try {
-			partialProvider.resolveNativeCompactionEndpoint?.(nativeModel, {});
+			partialProvider.resolveNativeCompactionRoutes?.(nativeModel, {});
 		} catch (error) {
 			expect((error as NativeCompactionError).code).toBe("unsupported");
 		}
@@ -626,14 +707,14 @@ describe("createProvider", () => {
 			models: [nativeModel, customModel],
 			api: {
 				"openai-responses": nativeStreams<"openai-responses">(() => ({
-					endpoint: "https://example.test/native",
-					protocol: "openai-responses-compact",
+					primary: { endpoint: "https://example.test/native", protocol: "openai-responses-compact" },
+					fallbacks: [],
 				})),
 				"custom-api": recordingStreams("custom", []),
 			},
 		});
 		expect(() =>
-			mixedProvider.resolveNativeCompactionEndpoint?.(customModel as unknown as Model<"openai-responses">, {}),
+			mixedProvider.resolveNativeCompactionRoutes?.(customModel as unknown as Model<"openai-responses">, {}),
 		).toThrowError(NativeCompactionError);
 	});
 
@@ -654,8 +735,8 @@ describe("createProvider", () => {
 			api: nativeStreams<"openai-responses">(
 				() =>
 					({
-						endpoint: "https://example.test/native",
-						protocol: "openai-codex-remote-v2",
+						primary: { endpoint: "https://example.test/native", protocol: "openai-codex-remote-v2" },
+						fallbacks: [],
 					}) as never,
 			),
 		});
@@ -667,8 +748,8 @@ describe("createProvider", () => {
 			api: nativeStreams<"openai-codex-responses">(
 				() =>
 					({
-						endpoint: "https://example.test/native",
-						protocol: "openai-responses-compact",
+						primary: { endpoint: "https://example.test/native", protocol: "openai-responses-compact" },
+						fallbacks: [],
 					}) as never,
 			),
 		});
@@ -680,7 +761,7 @@ describe("createProvider", () => {
 		});
 
 		const providerError = captureProviderNativeError(
-			() => failingProvider.resolveNativeCompactionEndpoint?.(model, {}),
+			() => failingProvider.resolveNativeCompactionRoutes?.(model, {}),
 			"provider_error",
 		);
 		expect(String(providerError)).not.toContain("sensitive-provider-error");
@@ -690,7 +771,7 @@ describe("createProvider", () => {
 			[invalidObjectProvider, model],
 		] as const) {
 			captureProviderNativeError(
-				() => provider.resolveNativeCompactionEndpoint?.(endpointModel as never, {}),
+				() => provider.resolveNativeCompactionRoutes?.(endpointModel as never, {}),
 				"protocol",
 			);
 		}
@@ -703,8 +784,8 @@ describe("createProvider", () => {
 			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
 			models: [model],
 			api: nativeStreams<"openai-responses">(() => ({
-				endpoint: "https://example.test/native",
-				protocol: "openai-responses-compact",
+				primary: { endpoint: "https://example.test/native", protocol: "openai-responses-compact" },
+				fallbacks: [],
 			})),
 		});
 		const forgedRequest = {

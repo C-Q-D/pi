@@ -121,7 +121,7 @@ describe("OpenAI Responses native compaction", () => {
 		expectTypeOf<CompactRequest>().toEqualTypeOf<NativeCompactionProviderRequest<"openai-responses">>();
 		expect(lazy.compact).toBeTypeOf("function");
 		expect(lazy.canConsumeProviderContext).toBeTypeOf("function");
-		expect(lazy.resolveNativeCompactionEndpoint).toBeTypeOf("function");
+		expect(lazy.resolveNativeCompactionRoutes).toBeTypeOf("function");
 	});
 
 	it("keeps an own undefined providerContext on the ordinary stream path", async () => {
