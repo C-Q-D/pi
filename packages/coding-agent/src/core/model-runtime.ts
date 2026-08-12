@@ -18,13 +18,18 @@ import {
 	type Models,
 	type ModelsApiStreamOptions,
 	ModelsError,
+	type ModelsNativeCompactionOptions,
+	type ModelsNativeCompactionTransforms,
 	type ModelsRefreshOptions,
 	type ModelsRefreshResult,
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
 	type ModelsStreamTransforms,
 	type MutableModels,
+	type NativeCompactionApi,
+	type NativeCompactionResult,
 	type Provider,
+	type ProviderContextEnvelope,
 	type ProviderHeaders,
 	type SimpleStreamOptions,
 	type StreamOptions,
@@ -463,6 +468,47 @@ export class ModelRuntime implements Models {
 				env,
 			},
 		};
+	}
+
+	/**
+	 * Project configured model headers are resolved after Pi AI has assembled
+	 * effective auth/env, while caller headers and transforms retain final say.
+	 */
+	private nativeCompactionTransforms(): ModelsNativeCompactionTransforms {
+		const config = this.config;
+		const extensionProviders = new Map(this.extensionProviders);
+		return {
+			transformHeadersBeforeRequest: (effectiveHeaders, requestModel, effectiveEnv) => {
+				const configuredHeaders = resolveConfiguredModelHeaders(
+					requestModel,
+					config.getProvider(requestModel.provider),
+					extensionProviders.get(requestModel.provider),
+					effectiveEnv ? { ...effectiveEnv } : undefined,
+				);
+				return mergeHeaders(effectiveHeaders, configuredHeaders) ?? {};
+			},
+		};
+	}
+
+	compact<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		context: Context,
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<NativeCompactionResult> {
+		return this.models.compactWithTransforms(model, context, options, this.nativeCompactionTransforms());
+	}
+
+	canConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<boolean> {
+		return this.models.canConsumeProviderContextWithTransforms(
+			model,
+			providerContext,
+			options,
+			this.nativeCompactionTransforms(),
+		);
 	}
 
 	stream<TApi extends Api>(

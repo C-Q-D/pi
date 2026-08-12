@@ -7,9 +7,12 @@ import {
 	type AuthResult,
 	type Context,
 	type Credential,
+	createNativeCompactionError,
 	lazyStream,
 	type Model,
 	type ModelAuth,
+	type NativeCompactionApi,
+	type NativeCompactionProviderCapabilities,
 	type OAuthAuth,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
@@ -382,7 +385,7 @@ function composeOAuthAuth(
 }
 
 function rawModelHeaders(
-	model: Model<Api>,
+	model: Readonly<Model<Api>>,
 	config: ModelsJsonProvider | undefined,
 	extension: ProviderConfigInput | undefined,
 ): Record<string, string> | undefined {
@@ -396,6 +399,16 @@ function rawModelHeaders(
 	return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+/** Keep composed models compatible with Native Preflight's closed optional-field contract. */
+function normalizeComposedModel(model: Model<Api>): Model<Api> {
+	const normalized = { ...model, cost: { ...model.cost } };
+	for (const key of ["thinkingLevelMap", "headers", "compat"] as const) {
+		if (normalized[key] === undefined) delete normalized[key];
+	}
+	if (normalized.cost.tiers === undefined) delete normalized.cost.tiers;
+	return normalized;
+}
+
 export function validateExtensionProvider(
 	providerId: string,
 	base: Provider | undefined,
@@ -406,6 +419,22 @@ export function validateExtensionProvider(
 		throw new Error(`Provider ${providerId}: "api" is required when registering streamSimple.`);
 	}
 	applyExtension(providerId, applyModelsJson(providerId, base?.getModels() ?? [], modelsConfig), extension);
+}
+
+/** Return the base provider's all-or-nothing Native Capability, never a partial trio. */
+function nativeCompactionCapabilities(
+	provider: Provider | undefined,
+): NativeCompactionProviderCapabilities<NativeCompactionApi> | undefined {
+	if (!provider) return undefined;
+	const candidate = provider as unknown as Record<string, unknown>;
+	if (
+		typeof candidate.compact !== "function" ||
+		typeof candidate.canConsumeProviderContext !== "function" ||
+		typeof candidate.resolveNativeCompactionRoutes !== "function"
+	) {
+		return undefined;
+	}
+	return provider as unknown as NativeCompactionProviderCapabilities<NativeCompactionApi>;
 }
 
 /** Compose built-in, models.json, and extension layers without reading credentials. */
@@ -433,7 +462,7 @@ export function composeModelProvider(
 		}
 		return models.map((model) => {
 			const override = config?.modelOverrides?.[model.id];
-			return override ? applyModelOverride(model, override) : model;
+			return normalizeComposedModel(override ? applyModelOverride(model, override) : model);
 		});
 	};
 	// Validate eagerly so registration/reload reports structural errors immediately.
@@ -443,6 +472,7 @@ export function composeModelProvider(
 	if (!apiKey && !oauth) throw new Error(`Provider ${providerId}: no authentication method configured.`);
 
 	const supportsBaseApi = (model: Model<Api>) => base?.getModels().some((entry) => entry.api === model.api) ?? false;
+	const nativeBase = nativeCompactionCapabilities(base);
 	const streamWith = (
 		model: Model<Api>,
 		context: Context,
@@ -465,7 +495,7 @@ export function composeModelProvider(
 				: api.stream(model, context, options);
 		});
 
-	return {
+	const providerCore: Provider = {
 		id: providerId,
 		name: extension?.name ?? config?.name ?? base?.name ?? extension?.oauth?.name ?? providerId,
 		baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl,
@@ -496,10 +526,25 @@ export function composeModelProvider(
 		stream: (model, context, options) => streamWith(model, context, options, false),
 		streamSimple: (model, context, options) => streamWith(model, context, options, true),
 	};
+	if (!nativeBase) return providerCore as Provider;
+
+	const nativeCapabilities: NativeCompactionProviderCapabilities<NativeCompactionApi> = {
+		// Delegate without reading request fields so the base provider's brand assertion remains first.
+		compact: (request) => nativeBase.compact(request),
+		canConsumeProviderContext: (request) => nativeBase.canConsumeProviderContext(request),
+		resolveNativeCompactionRoutes: (model, options) => {
+			if (extension?.streamSimple && model.api === extension.api) {
+				throw createNativeCompactionError("unsupported");
+			}
+			if (!supportsBaseApi(model)) throw createNativeCompactionError("unsupported");
+			return nativeBase.resolveNativeCompactionRoutes(model, options);
+		},
+	};
+	return Object.assign(providerCore, nativeCapabilities) as Provider;
 }
 
 export function resolveConfiguredModelHeaders(
-	model: Model<Api>,
+	model: Readonly<Model<Api>>,
 	config: ModelsJsonProvider | undefined,
 	extension: ProviderConfigInput | undefined,
 	env?: Record<string, string>,

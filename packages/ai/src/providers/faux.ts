@@ -6,6 +6,9 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	NativeCompactionProviderRequest,
+	NativeCompactionResult,
+	ProviderStreams,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -16,6 +19,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
+import { createNativeCompactionError } from "../utils/native-compaction.ts";
 
 const DEFAULT_API = "faux";
 const DEFAULT_PROVIDER = "faux";
@@ -24,6 +28,8 @@ const DEFAULT_MODEL_NAME = "Faux Model";
 const DEFAULT_BASE_URL = "http://localhost:0";
 const DEFAULT_MIN_TOKEN_SIZE = 3;
 const DEFAULT_MAX_TOKEN_SIZE = 5;
+const DEFAULT_NATIVE_COMPACTION_ENDPOINT = "https://faux.invalid/v1/responses/compact";
+const FAUX_NATIVE_API_KEY = "faux-native-test-key";
 
 const DEFAULT_USAGE: Usage = {
 	input: 0,
@@ -102,6 +108,39 @@ export type FauxResponseFactory = (
 
 export type FauxResponseStep = AssistantMessage | FauxResponseFactory;
 
+export interface FauxNativeCompactionState {
+	readonly compactCallCount: number;
+	readonly consumerCallCount: number;
+	readonly compactCalls: readonly NativeCompactionProviderRequest<"openai-responses">[];
+	readonly consumerCalls: readonly NativeCompactionProviderRequest<"openai-responses">[];
+}
+
+export type FauxCompactionFactory = (
+	request: NativeCompactionProviderRequest<"openai-responses">,
+	state: FauxNativeCompactionState,
+) => NativeCompactionResult | Promise<NativeCompactionResult>;
+
+export type FauxCompactionStep = NativeCompactionResult | FauxCompactionFactory;
+
+export type FauxConsumerFactory = (
+	request: NativeCompactionProviderRequest<"openai-responses">,
+	state: FauxNativeCompactionState,
+) => boolean | Promise<boolean>;
+
+export interface FauxNativeCompactionOptions {
+	endpoint?: string;
+	results?: FauxCompactionStep[];
+	consumer?: boolean | FauxConsumerFactory;
+}
+
+export interface FauxNativeCompactionControl {
+	readonly state: FauxNativeCompactionState;
+	setResults(results: FauxCompactionStep[]): void;
+	appendResults(results: FauxCompactionStep[]): void;
+	getPendingResultCount(): number;
+	setConsumer(consumer: boolean | FauxConsumerFactory): void;
+}
+
 export interface RegisterFauxProviderOptions {
 	api?: string;
 	provider?: string;
@@ -111,6 +150,11 @@ export interface RegisterFauxProviderOptions {
 		min?: number;
 		max?: number;
 	};
+}
+
+export interface FauxProviderOptions extends RegisterFauxProviderOptions {
+	/** Explicit opt-in for production-shaped public OpenAI native compaction tests. */
+	nativeCompaction?: FauxNativeCompactionOptions;
 }
 
 export interface FauxProviderRegistration {
@@ -135,6 +179,7 @@ export interface FauxProviderHandle {
 	setResponses: (responses: FauxResponseStep[]) => void;
 	appendResponses: (responses: FauxResponseStep[]) => void;
 	getPendingResponseCount: () => number;
+	readonly nativeCompaction?: FauxNativeCompactionControl;
 }
 
 function estimateTokens(text: string): number {
@@ -520,8 +565,86 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
  * faux.setResponses([fauxAssistantMessage("hi")]);
  * ```
  */
-export function fauxProvider(options: RegisterFauxProviderOptions = {}): FauxProviderHandle {
-	const core = createFauxCore(options);
+export function fauxProvider(options: FauxProviderOptions = {}): FauxProviderHandle {
+	if (options.nativeCompaction && options.api !== undefined && options.api !== "openai-responses") {
+		throw new Error('Faux native compaction only supports api "openai-responses".');
+	}
+	const core = createFauxCore(options.nativeCompaction ? { ...options, api: "openai-responses" } : options);
+	if (options.nativeCompaction) {
+		const models = core.models as [Model<"openai-responses">, ...Model<"openai-responses">[]];
+		const nativeEndpoint = options.nativeCompaction.endpoint ?? DEFAULT_NATIVE_COMPACTION_ENDPOINT;
+		let pendingResults = [...(options.nativeCompaction.results ?? [])];
+		let consumer: boolean | FauxConsumerFactory = options.nativeCompaction.consumer ?? true;
+		const compactCalls: NativeCompactionProviderRequest<"openai-responses">[] = [];
+		const consumerCalls: NativeCompactionProviderRequest<"openai-responses">[] = [];
+		const mutableState = {
+			compactCallCount: 0,
+			consumerCallCount: 0,
+			compactCalls,
+			consumerCalls,
+		};
+		const state: FauxNativeCompactionState = mutableState;
+		const streams: ProviderStreams<"openai-responses"> = {
+			stream: (model, context, streamOptions) => core.stream(model, context, streamOptions),
+			streamSimple: (model, context, streamOptions) => core.streamSimple(model, context, streamOptions),
+			compact: async (request) => {
+				mutableState.compactCallCount++;
+				compactCalls.push(request);
+				const step = pendingResults.shift();
+				if (!step) throw createNativeCompactionError("provider_error");
+				return typeof step === "function" ? step(request, state) : step;
+			},
+			canConsumeProviderContext: async (request) => {
+				mutableState.consumerCallCount++;
+				consumerCalls.push(request);
+				return typeof consumer === "function" ? consumer(request, state) : consumer;
+			},
+			resolveNativeCompactionRoutes: () => ({
+				primary: {
+					endpoint: nativeEndpoint,
+					protocol: "openai-responses-compact",
+				},
+				fallbacks: [],
+			}),
+		};
+		const provider = createProvider({
+			id: core.provider,
+			auth: {
+				apiKey: {
+					name: "Faux native compaction",
+					resolve: async () => ({ auth: { apiKey: FAUX_NATIVE_API_KEY }, source: "faux test credential" }),
+				},
+			},
+			models,
+			api: streams,
+		});
+		const nativeCompaction: FauxNativeCompactionControl = {
+			state,
+			setResults(results) {
+				pendingResults = [...results];
+			},
+			appendResults(results) {
+				pendingResults.push(...results);
+			},
+			getPendingResultCount() {
+				return pendingResults.length;
+			},
+			setConsumer(nextConsumer) {
+				consumer = nextConsumer;
+			},
+		};
+		return {
+			provider,
+			api: core.api,
+			models: core.models,
+			getModel: core.getModel,
+			state: core.state,
+			setResponses: core.setResponses,
+			appendResponses: core.appendResponses,
+			getPendingResponseCount: core.getPendingResponseCount,
+			nativeCompaction,
+		};
+	}
 	const provider = createProvider({
 		id: core.provider,
 		auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },

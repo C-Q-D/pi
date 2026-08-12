@@ -90,11 +90,25 @@ export interface ModelsRefreshResult {
 
 export interface ModelsStreamTransforms {
 	/** Transform fully assembled model/auth/request headers before provider dispatch. */
-	transformHeaders?: (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>;
+	transformHeaders?: (
+		headers: ProviderHeaders,
+		env?: Readonly<Record<string, string>>,
+	) => ProviderHeaders | Promise<ProviderHeaders>;
+}
+
+/** Internal request assembly hooks used by app-level Models wrappers. */
+export interface ModelsNativeCompactionTransforms {
+	transformHeadersBeforeRequest?: (
+		headers: ProviderHeaders,
+		model: Readonly<Model<Api>>,
+		env?: Readonly<Record<string, string>>,
+	) => ProviderHeaders | Promise<ProviderHeaders>;
 }
 
 export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsStreamTransforms;
 export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamTransforms;
+export type ModelsNativeCompactionOptions<TApi extends NativeCompactionApi> = NativeCompactionPublicOptionsMap[TApi] &
+	ModelsStreamTransforms;
 
 /**
  * A provider is the concrete runtime unit. It owns id/name/base metadata,
@@ -244,13 +258,13 @@ export interface NativeCompactionModels {
 	compact<TApi extends NativeCompactionApi>(
 		model: Model<TApi>,
 		context: Context,
-		options?: NativeCompactionPublicOptionsMap[TApi],
+		options?: ModelsNativeCompactionOptions<TApi>,
 	): Promise<NativeCompactionResult>;
 
 	canConsumeProviderContext<TApi extends NativeCompactionApi>(
 		model: Model<TApi>,
 		providerContext: ProviderContextEnvelope,
-		options?: NativeCompactionPublicOptionsMap[TApi],
+		options?: ModelsNativeCompactionOptions<TApi>,
 	): Promise<boolean>;
 }
 
@@ -260,6 +274,18 @@ export type MutableModels = Models &
 		setProvider(provider: Provider): void;
 		deleteProvider(id: string): void;
 		clearProviders(): void;
+		compactWithTransforms<TApi extends NativeCompactionApi>(
+			model: Model<TApi>,
+			context: Context,
+			options: ModelsNativeCompactionOptions<TApi> | undefined,
+			transforms: ModelsNativeCompactionTransforms,
+		): Promise<NativeCompactionResult>;
+		canConsumeProviderContextWithTransforms<TApi extends NativeCompactionApi>(
+			model: Model<TApi>,
+			providerContext: ProviderContextEnvelope,
+			options: ModelsNativeCompactionOptions<TApi> | undefined,
+			transforms: ModelsNativeCompactionTransforms,
+		): Promise<boolean>;
 	};
 
 export interface CreateModelsOptions {
@@ -449,6 +475,28 @@ function validateNativeCompactionOptions<TApi extends NativeCompactionApi>(
 	} catch (error) {
 		throw sanitizeNativeCompactionError(error, "invalid_context");
 	}
+}
+
+/** 校验 Models 私有的 Header Transform，同时保持 Provider 公开选项闭合。 */
+function validateModelsNativeCompactionOptions<TApi extends NativeCompactionApi>(
+	api: TApi,
+	properties: ReadonlyMap<string, unknown>,
+): Readonly<ModelsNativeCompactionOptions<TApi>> {
+	const publicOptions: Record<string, unknown> = {};
+	let transformHeaders: ModelsStreamTransforms["transformHeaders"];
+	for (const [key, value] of properties) {
+		if (key === "transformHeaders") {
+			if (typeof value !== "function") throw createNativeCompactionError("invalid_context");
+			transformHeaders = value as NonNullable<ModelsStreamTransforms["transformHeaders"]>;
+			continue;
+		}
+		publicOptions[key] = value;
+	}
+	const validated = validateNativeCompactionOptions(api, publicOptions);
+	return Object.freeze({
+		...validated,
+		...(transformHeaders ? { transformHeaders } : {}),
+	}) as Readonly<ModelsNativeCompactionOptions<TApi>>;
 }
 
 /** 判断 API 是否属于首版原生压缩白名单。 */
@@ -926,6 +974,7 @@ class ModelsImpl implements MutableModels {
 	private async applyAuth<TOptions extends StreamOptions & ModelsStreamTransforms>(
 		model: Model<Api>,
 		options: TOptions | undefined,
+		transforms?: ModelsNativeCompactionTransforms,
 	): Promise<{ requestModel: Model<Api>; requestOptions: StreamOptions | undefined; resolution: AuthResult }> {
 		this.requireProvider(model);
 		const resolution = await this.getAuth(model, {
@@ -938,11 +987,16 @@ class ModelsImpl implements MutableModels {
 		}
 		const auth = resolution.auth;
 
-		// Explicit request options win per-field; the Models-only transform runs last.
+		// App/model headers run after auth; explicit request headers and their transform retain final say.
 		const apiKey = options?.apiKey ?? auth.apiKey;
-		let headers = mergeHeaders(auth.headers, options?.headers);
-		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
+		const transformEnv = env ? Object.freeze({ ...env }) : undefined;
+		let headers = auth.headers;
+		if (transforms?.transformHeadersBeforeRequest) {
+			headers = await transforms.transformHeadersBeforeRequest(headers ?? {}, model, transformEnv);
+		}
+		headers = mergeHeaders(headers, options?.headers);
+		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {}, transformEnv);
 		const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 		const requestOptions = { ...providerOptions, apiKey, headers, env } as StreamOptions;
@@ -1006,6 +1060,7 @@ class ModelsImpl implements MutableModels {
 		context: Context,
 		options: unknown,
 		inputKind: "native" | "stream",
+		transforms?: ModelsNativeCompactionTransforms,
 	): Promise<NativeCompactionPreflight<TApi>> {
 		let rawOptionProperties: ReadonlyMap<string, unknown>;
 		try {
@@ -1032,7 +1087,8 @@ class ModelsImpl implements MutableModels {
 
 		const rawStreamOptions =
 			inputKind === "native"
-				? (validateNativeCompactionOptions(inputModelSnapshot.api, options ?? {}) as StreamOptions)
+				? (validateModelsNativeCompactionOptions(inputModelSnapshot.api, rawOptionProperties) as StreamOptions &
+						ModelsStreamTransforms)
 				: cloneStreamOptionsForNative(options);
 		const rawNativeOptions = selectNativeCompactionOptions(inputModelSnapshot.api, rawStreamOptions);
 		if (inputModelSnapshot.api === "openai-codex-responses" && rawOptionProperties.has("apiKey")) {
@@ -1055,6 +1111,7 @@ class ModelsImpl implements MutableModels {
 			authResult = await this.applyAuth(
 				inputModelSnapshot,
 				rawStreamOptions as StreamOptions & ModelsStreamTransforms,
+				transforms,
 			);
 		} catch (error) {
 			throwIfNativeCompactionAborted(signal);
@@ -1133,9 +1190,18 @@ class ModelsImpl implements MutableModels {
 	async compact<TApi extends NativeCompactionApi>(
 		model: Model<TApi>,
 		context: Context,
-		options?: NativeCompactionPublicOptionsMap[TApi],
+		options?: ModelsNativeCompactionOptions<TApi>,
 	): Promise<NativeCompactionResult> {
-		const preflight = await this.nativeCompactionPreflight(model, context, options, "native");
+		return this.compactWithTransforms(model, context, options, {});
+	}
+
+	async compactWithTransforms<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		context: Context,
+		options: ModelsNativeCompactionOptions<TApi> | undefined,
+		transforms: ModelsNativeCompactionTransforms,
+	): Promise<NativeCompactionResult> {
+		const preflight = await this.nativeCompactionPreflight(model, context, options, "native", transforms);
 		try {
 			const rawResult: unknown = await preflight.provider.compact(preflight.request);
 			throwIfNativeCompactionAborted(preflight.request.options.signal);
@@ -1156,13 +1222,23 @@ class ModelsImpl implements MutableModels {
 	async canConsumeProviderContext<TApi extends NativeCompactionApi>(
 		model: Model<TApi>,
 		providerContext: ProviderContextEnvelope,
-		options?: NativeCompactionPublicOptionsMap[TApi],
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<boolean> {
+		return this.canConsumeProviderContextWithTransforms(model, providerContext, options, {});
+	}
+
+	async canConsumeProviderContextWithTransforms<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options: ModelsNativeCompactionOptions<TApi> | undefined,
+		transforms: ModelsNativeCompactionTransforms,
 	): Promise<boolean> {
 		const preflight = await this.nativeCompactionPreflight(
 			model,
 			{ messages: [], providerContext },
 			options,
 			"native",
+			transforms,
 		);
 		try {
 			const result: unknown = await preflight.provider.canConsumeProviderContext(preflight.request);

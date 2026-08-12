@@ -251,6 +251,63 @@ describe("Models native compaction preflight", () => {
 		expect(result.providerContext.binding).toEqual(request.binding);
 	});
 
+	it("runs the Models-only header transform once with effective auth and environment", async () => {
+		const resolve = vi.fn(async () => ({
+			auth: { apiKey: "effective-key", headers: { "x-auth": "auth", "x-shared": "auth" } },
+			env: { AUTH_ONLY: "auth", SHARED: "auth" },
+			source: "test",
+		}));
+		const harness = nativeHarness("native-transform", "openai-responses", {
+			name: "Transform key",
+			resolve,
+		});
+		const models = createModels({ authContext });
+		models.setProvider(harness.provider);
+		const transformHeaders = vi.fn(
+			async (headers: Readonly<Record<string, string | null>>, env?: Readonly<Record<string, string>>) => {
+				expect(headers).toEqual({
+					"x-auth": "auth",
+					"x-shared": "caller",
+					"x-caller": "caller",
+				});
+				expect(env).toEqual({ AUTH_ONLY: "auth", SHARED: "caller", CALLER_ONLY: "caller" });
+				return { ...headers, "x-transformed": env?.CALLER_ONLY ?? null };
+			},
+		);
+
+		await models.compact(
+			harness.model,
+			{ messages: [] },
+			{
+				headers: { "x-shared": "caller", "x-caller": "caller" },
+				env: { SHARED: "caller", CALLER_ONLY: "caller" },
+				transformHeaders,
+			},
+		);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
+		expect(transformHeaders).toHaveBeenCalledTimes(1);
+		expect(harness.compactCalls[0]!.options).not.toHaveProperty("transformHeaders");
+		expect(harness.compactCalls[0]!.options).toMatchObject({
+			apiKey: "effective-key",
+			headers: {
+				"x-auth": "auth",
+				"x-shared": "caller",
+				"x-caller": "caller",
+				"x-transformed": "caller",
+			},
+			env: { AUTH_ONLY: "auth", SHARED: "caller", CALLER_ONLY: "caller" },
+		});
+
+		await expect(
+			models.compact(harness.model, { messages: [] }, { transformHeaders: undefined } as never),
+		).rejects.toSatisfy((error) => {
+			expectNativeCode(error, "invalid_context");
+			return true;
+		});
+		expect(resolve).toHaveBeenCalledTimes(1);
+	});
+
 	it("accepts only bindings from the preauthorized route set and keeps one frozen authorization identity", async () => {
 		const model = nativeModel("route-set", "openai-responses");
 		let capturedRequest: NativeCompactionProviderRequest<"openai-responses"> | undefined;
