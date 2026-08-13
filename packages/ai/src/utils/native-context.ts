@@ -159,6 +159,14 @@ function requireProjectedFields(properties: ReadonlyMap<string, unknown>, requir
 	}
 }
 
+function omitUndefinedOptionalFields(
+	properties: ReadonlyMap<string, unknown>,
+	required: readonly string[],
+): ReadonlyMap<string, unknown> {
+	const requiredFields = new Set(required);
+	return new Map([...properties].filter(([key, value]) => value !== undefined || requiredFields.has(key)));
+}
+
 type MessageRole = "user" | "assistant" | "toolResult";
 
 function cloneContentItem(value: unknown, role: MessageRole): JsonValue {
@@ -198,7 +206,7 @@ function cloneContentItem(value: unknown, role: MessageRole): JsonValue {
 							allowed: new Set(["type", "id", "name", "arguments", "thoughtSignature"]),
 							required: ["type", "id", "name", "arguments"],
 						};
-	const properties = readProjectedObject(value, fields.allowed);
+	const properties = omitUndefinedOptionalFields(readProjectedObject(value, fields.allowed), fields.required);
 	requireProjectedFields(properties, fields.required);
 	const requiredStrings =
 		type === "text"
@@ -284,8 +292,12 @@ function cloneMessage(value: unknown): Message {
 			: role === "assistant"
 				? new Set(["diagnostics"])
 				: new Set<string>();
-	const properties = readProjectedObject(value, MESSAGE_FIELDS[role], omitted);
-	requireProjectedFields(properties, MESSAGE_REQUIRED_FIELDS[role]);
+	const requiredFields = MESSAGE_REQUIRED_FIELDS[role];
+	const properties = omitUndefinedOptionalFields(
+		readProjectedObject(value, MESSAGE_FIELDS[role], omitted),
+		requiredFields,
+	);
+	requireProjectedFields(properties, requiredFields);
 	const content = properties.get("content");
 	const timestamp = properties.get("timestamp");
 	if (

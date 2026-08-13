@@ -6,6 +6,10 @@
 
 - Added provider-native context binding guards for ordinary streams and compaction, with sanitized mismatch dimensions and portable authenticated request snapshots.
 
+### Fixed
+
+- Fixed native compaction context projection to omit optional message fields whose values are `undefined`, matching Pi's canonical message shapes without weakening strict validation.
+
 ## [0.83.0] - 2026-07-29
 
 ### Breaking Changes

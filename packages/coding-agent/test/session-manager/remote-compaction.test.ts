@@ -66,6 +66,19 @@ function createRemoteMetadata(operationId: string, providerContext: ProviderCont
 	});
 }
 
+function createLocalMetadata(operationId: string, tokensBefore = 120) {
+	return createCompactionMetadata({
+		type: "compaction",
+		attemptId: `attempt-${operationId}`,
+		operationId,
+		reason: "manual",
+		requestedStrategy: "local",
+		effectiveStrategy: "local",
+		tokensBefore,
+		experimental: true,
+	});
+}
+
 function assistantMessage(text: string): Message {
 	return {
 		role: "assistant",
@@ -177,22 +190,45 @@ describe("remote compaction session v4", () => {
 		});
 	});
 
-	it("returns the committed entry when the same operation is appended again", () => {
+	it("returns the committed remote entry only when operation and entry identities both match", () => {
 		const session = SessionManager.inMemory();
 		appendConversationPrefix(session);
 		const committed = appendRemote(session, "remote-first", "operation-stable");
 		const leafAfterCommit = session.getLeafId();
 		const duplicate = appendRemote(
 			session,
-			"remote-duplicate",
+			"remote-first",
 			"operation-stable",
 			createProviderContext("SHOULD_NOT_BE_COMMITTED"),
 		);
 
 		expect(duplicate).toBe(committed);
+		expect(() => appendRemote(session, "remote-duplicate", "operation-stable")).toThrow();
 		expect(session.getLeafId()).toBe(leafAfterCommit);
 		expect(session.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
 		expect(session.getEntry("remote-duplicate")).toBeUndefined();
+	});
+
+	it("returns the committed local entry only when operation and entry identities both match", () => {
+		const session = SessionManager.inMemory();
+		const { userId } = appendConversationPrefix(session);
+		const options = {
+			entryId: "local-first",
+			operationId: "operation-local-stable",
+			timestamp: "2026-08-13T00:00:00.000Z",
+			summary: "Local checkpoint",
+			firstKeptEntryId: userId,
+			tokensBefore: 120,
+			metadata: createLocalMetadata("operation-local-stable"),
+		};
+		const committed = session.appendCompactionTransaction(options);
+		const leafAfterCommit = session.getLeafId();
+
+		expect(session.appendCompactionTransaction(options)).toBe(committed);
+		expect(() => session.appendCompactionTransaction({ ...options, entryId: "local-duplicate" })).toThrow();
+		expect(session.getLeafId()).toBe(leafAfterCommit);
+		expect(session.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(session.getEntry("local-duplicate")).toBeUndefined();
 	});
 
 	it("rolls back in-memory state when the session append fails", () => {

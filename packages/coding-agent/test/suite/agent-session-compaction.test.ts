@@ -5,7 +5,7 @@ import {
 	type Model,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { CompactionBoundaryError, estimateTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -85,6 +85,16 @@ function seedCompactableSession(harness: Harness): void {
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
+async function expectCompactionCode(promise: Promise<unknown>, code: CompactionBoundaryError["code"]): Promise<void> {
+	try {
+		await promise;
+		expect.fail(`Expected CompactionBoundaryError(${code})`);
+	} catch (error) {
+		expect(error).toBeInstanceOf(CompactionBoundaryError);
+		expect((error as CompactionBoundaryError).code).toBe(code);
+	}
+}
+
 describe("AgentSession compaction characterization", () => {
 	const harnesses: Harness[] = [];
 
@@ -153,14 +163,15 @@ describe("AgentSession compaction characterization", () => {
 		harnesses.push(harness);
 		harness.session.agent.state.model = undefined as unknown as Model<any>;
 
-		await expect(harness.session.compact()).rejects.toThrow("No model selected");
+		await expectCompactionCode(harness.session.compact(), "no_model");
 	});
 
 	it("throws when compacting without configured auth", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
+		seedCompactableSession(harness);
 
-		await expect(harness.session.compact()).rejects.toThrow(`No API key found for ${harness.getModel().provider}.`);
+		await expectCompactionCode(harness.session.compact(), "unknown");
 	});
 
 	it("manually compacts with a custom streamFn when registry auth is absent", async () => {
@@ -264,7 +275,7 @@ describe("AgentSession compaction characterization", () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		harness.session.abortCompaction();
 
-		await expect(compactPromise).rejects.toThrow("Compaction cancelled");
+		await expectCompactionCode(compactPromise, "cancelled");
 	});
 
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {

@@ -5,6 +5,7 @@
 ### Added
 
 - Added exact provider-context binding checks for model switching and restored sessions, plus a provider-independent local recovery primitive for remote checkpoints.
+- Added one manual compaction transaction for Local, Remote, and Auto strategies, including safe fallback, idempotent checkpoint commits, abort and branch guards, and sanitized extension events.
 
 ## [0.83.0] - 2026-07-29
 

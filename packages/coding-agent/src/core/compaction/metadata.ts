@@ -25,6 +25,11 @@ export type CompactionMetadataErrorCode =
 	| "already_compacted"
 	| "nothing_to_compact"
 	| "no_model"
+	| "in_progress"
+	| "stale_branch"
+	| "invalid_hook_result"
+	| "commit_indeterminate"
+	| "committed_restart_required"
 	| "unknown";
 
 /** 可安全公开的 Usage Cost。 */
@@ -212,6 +217,11 @@ const COMPACTION_ERROR_CODES = new Set<CompactionMetadataErrorCode>([
 	"already_compacted",
 	"nothing_to_compact",
 	"no_model",
+	"in_progress",
+	"stale_branch",
+	"invalid_hook_result",
+	"commit_indeterminate",
+	"committed_restart_required",
 	"unknown",
 ]);
 
@@ -228,6 +238,12 @@ const COMPACTION_ERROR_MESSAGES = {
 	already_compacted: "The current context is already compacted.",
 	nothing_to_compact: "The current session is too small to compact.",
 	no_model: "No model is selected for compaction.",
+	in_progress: "Another compaction attempt is already in progress.",
+	stale_branch: "The active session branch changed during compaction.",
+	invalid_hook_result: "The compaction extension returned a result that is not valid for this strategy.",
+	commit_indeterminate: "Compaction commit could not be confirmed. Restart before retrying.",
+	committed_restart_required:
+		"Compaction was committed, but the active context could not be rebuilt. Restart required.",
 	unknown: "Compaction failed.",
 } as const satisfies Record<CompactionMetadataErrorCode, string>;
 

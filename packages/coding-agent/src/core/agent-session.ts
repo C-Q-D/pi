@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -24,7 +25,13 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, createNativeCompactionError, type NativeCompactionApi } from "@earendil-works/pi-ai";
+import {
+	type Context,
+	contentText,
+	createNativeCompactionError,
+	type NativeCompactionApi,
+	type NativeCompactionResult,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -52,11 +59,16 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	CompactionBoundaryError,
+	type CompactionMetadata,
 	type CompactionMetadataErrorCode,
+	type CompactionPreparation,
+	type CompactionReason,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	createCompactionMetadata,
 	createExternalSessionEntries,
 	createExternalSessionEntry,
 	createSanitizedCompactionEntry,
@@ -66,6 +78,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	type RequestedCompactionStrategy,
 	type SanitizedCompactionResult,
 	sanitizeCompactionError,
 	shouldCompact,
@@ -105,8 +118,19 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	RemoteCompactionEntry,
+	SessionEntry,
+	SessionManager,
+} from "./session-manager.ts";
+import {
+	buildSessionContext,
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionEntry,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -257,6 +281,57 @@ export interface PromptOptions {
 	preflightResult?: (success: boolean) => void;
 }
 
+/** 单次显式压缩请求的选项；字符串输入继续表示 Local 自定义指令。 */
+export interface CompactOptions {
+	/** 本次请求的策略；持久化设置接入前默认 Local。 */
+	requestedStrategy?: RequestedCompactionStrategy;
+	/** 只供 Local 压缩或 Auto 的 Local 回退使用的附加指令。 */
+	customInstructions?: string;
+}
+
+/** Manual 当前使用、后续 Threshold/Overflow Adapter 复用的内部触发字段。 */
+interface CompactionAttemptOptions extends CompactOptions {
+	reason: CompactionReason;
+	excludedEntryIds: ReadonlySet<string>;
+	willRetry: boolean;
+}
+
+type CompactionAttemptPhase =
+	| "preparing"
+	| "hook"
+	| "native"
+	| "local"
+	| "pre_append"
+	| "append"
+	| "rebuild"
+	| "committed";
+
+interface ActiveCompactionAttempt {
+	readonly attemptId: string;
+	readonly operationId: string;
+	readonly entryId: string;
+	readonly entryTimestamp: string;
+	startingLeafId: string | null;
+	readonly requestedStrategy: RequestedCompactionStrategy;
+	phase: CompactionAttemptPhase;
+	committed: boolean;
+}
+
+interface LocalGeneratedCompaction {
+	readonly effectiveStrategy: "local";
+	readonly result: CompactionResult;
+	readonly fromExtension: boolean;
+	readonly fallbackCode?: CompactionMetadataErrorCode;
+}
+
+interface RemoteGeneratedCompaction {
+	readonly effectiveStrategy: "remote";
+	readonly result: NativeCompactionResult;
+	readonly tokensBefore: number;
+}
+
+type GeneratedCompaction = LocalGeneratedCompaction | RemoteGeneratedCompaction;
+
 /** Result from cycleModel() */
 export interface ModelCycleResult {
 	model: Model<any>;
@@ -333,6 +408,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _activeCompactionAttempt: ActiveCompactionAttempt | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -553,10 +629,14 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** 向所有 Listener 发出事件；外部 Listener 异常不得改变 Session 事务结果。 */
 	private _emit(event: AgentSessionEvent): void {
 		for (const l of this._eventListeners) {
-			l(event);
+			try {
+				l(event);
+			} catch {
+				// Listener 不受信任；错误内容不得进入 Session Error 或 Provider 日志。
+			}
 		}
 	}
 
@@ -1813,150 +1893,406 @@ export class AgentSession {
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
-	 * @param customInstructions Optional instructions for the compaction summary
+	 * 字符串参数继续保留历史 Local 压缩自定义指令语义。
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
-		this._disconnectFromAgent();
-		await this.abort();
+	async compact(customInstructions?: string): Promise<SanitizedCompactionResult>;
+	async compact(options?: CompactOptions): Promise<SanitizedCompactionResult>;
+	async compact(input?: string | CompactOptions): Promise<SanitizedCompactionResult> {
+		const options: CompactionAttemptOptions = {
+			reason: "manual",
+			requestedStrategy: typeof input === "string" ? "local" : (input?.requestedStrategy ?? "local"),
+			customInstructions: typeof input === "string" ? input : input?.customInstructions,
+			excludedEntryIds: new Set(),
+			willRetry: false,
+		};
+		if (options.requestedStrategy === "remote" && options.customInstructions?.trim()) {
+			throw new CompactionBoundaryError("unsupported");
+		}
+		return this._runCompactionAttempt(options);
+	}
+
+	/** 从准备到重建执行一次 Single-flight 压缩事务。 */
+	private async _runCompactionAttempt(options: CompactionAttemptOptions): Promise<SanitizedCompactionResult> {
+		if (this._activeCompactionAttempt) {
+			throw new CompactionBoundaryError("in_progress");
+		}
+
+		const attempt: ActiveCompactionAttempt = {
+			attemptId: randomUUID(),
+			operationId: randomUUID(),
+			entryId: randomUUID(),
+			entryTimestamp: new Date().toISOString(),
+			startingLeafId: this.sessionManager.getLeafId(),
+			requestedStrategy: options.requestedStrategy ?? "local",
+			phase: "preparing",
+			committed: false,
+		};
+		this._activeCompactionAttempt = attempt;
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		this._disconnectFromAgent();
 
 		try {
-			if (!this.model) {
-				throw new Error(formatNoModelSelectedMessage());
-			}
-
-			const { apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
-
-			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
-				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
-				}
-				throw new Error("Nothing to compact (session too small)");
-			}
-
-			let extensionCompaction: CompactionResult | undefined;
-			let fromExtension = false;
-
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const result = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: createExternalSessionEntries(pathEntries),
-					customInstructions,
-					reason: "manual",
-					willRetry: false,
-					signal: this._compactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
-
-				if (result?.cancel) {
-					throw new Error("Compaction cancelled");
-				}
-
-				if (result?.compaction) {
-					extensionCompaction = result.compaction;
-					fromExtension = true;
-				}
-			}
-
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let usage: Usage | undefined;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				// Generate compaction result
-				const result = await compact(
-					preparation,
-					this.model,
-					apiKey,
-					headers,
-					customInstructions,
-					this._compactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
-					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
-				);
-				summary = result.summary;
-				firstKeptEntryId = result.firstKeptEntryId;
-				tokensBefore = result.tokensBefore;
-				usage = result.usage;
-				details = result.details;
-			}
-
-			if (this._compactionAbortController.signal.aborted) {
-				throw new Error("Compaction cancelled");
-			}
-
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
-
-			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
-
-			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: createSanitizedCompactionEntry(savedCompactionEntry, { reason: "manual" }),
-					fromExtension,
-					reason: "manual",
-					willRetry: false,
-				});
-			}
-
-			const compactionResult: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				usage,
-				details,
-			};
-			this._emit({
-				type: "compaction_end",
-				reason: "manual",
-				result: createSanitizedCompactionResult(compactionResult, { reason: "manual" }),
-				aborted: false,
-				willRetry: false,
-			});
-			return compactionResult;
+			await this.abort();
+			this._throwIfCompactionAborted();
+			attempt.startingLeafId = this.sessionManager.getLeafId();
+			this._emit({ type: "compaction_start", reason: options.reason });
+			return await this._executeCompactionAttempt(attempt, options);
 		} catch (error) {
 			const sanitizedError = sanitizeCompactionError(error);
 			const aborted = sanitizedError.code === "cancelled" || sanitizedError.code === "aborted";
 			this._emit({
 				type: "compaction_end",
-				reason: "manual",
+				reason: options.reason,
 				result: undefined,
 				aborted,
-				willRetry: false,
+				willRetry: attempt.committed ? options.willRetry : false,
 				errorCode: sanitizedError.code,
 				errorMessage: aborted ? undefined : `Compaction failed: ${sanitizedError.message}`,
 			});
 			throw sanitizedError;
 		} finally {
+			if (this._activeCompactionAttempt === attempt) this._activeCompactionAttempt = undefined;
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+		}
+	}
+
+	/** 执行策略选择、一次 Provider/Local 生成、幂等 Append 与重建。 */
+	private async _executeCompactionAttempt(
+		attempt: ActiveCompactionAttempt,
+		options: CompactionAttemptOptions,
+	): Promise<SanitizedCompactionResult> {
+		const selectedModel = this.model;
+		if (!selectedModel) throw new CompactionBoundaryError("no_model");
+		const model = structuredClone(selectedModel);
+		const initialContext = this.sessionManager.buildSessionContext();
+		const activeEntries = this.sessionManager.getBranch();
+		const activeLeaf = activeEntries.at(-1);
+		if (
+			activeLeaf?.type === "compaction" ||
+			(attempt.requestedStrategy !== "local" &&
+				(activeLeaf?.type === "remote_compaction" ||
+					(initialContext.providerContext !== undefined && initialContext.messages.length === 0)))
+		) {
+			throw new CompactionBoundaryError("already_compacted");
+		}
+
+		const localEntries = this._getLocalCompactionEntries(initialContext, options.excludedEntryIds);
+		const preparation = prepareCompaction(localEntries, this.settingsManager.getCompactionSettings());
+		if (!preparation) throw new CompactionBoundaryError("nothing_to_compact");
+
+		attempt.phase = "hook";
+		const extensionCompaction = await this._runCompactionHook(preparation, activeEntries, options);
+		this._throwIfCompactionAborted();
+		this._assertCompactionBranchUnchanged(attempt);
+
+		let generated: GeneratedCompaction;
+		if (extensionCompaction) {
+			if (attempt.requestedStrategy === "remote") {
+				throw new CompactionBoundaryError("invalid_hook_result");
+			}
+			generated = {
+				effectiveStrategy: "local",
+				result: this._validateExtensionCompaction(extensionCompaction, localEntries),
+				fromExtension: true,
+			};
+		} else if (attempt.requestedStrategy === "local") {
+			generated = await this._generateLocalCompaction(model, preparation, options, attempt);
+		} else {
+			try {
+				generated = await this._generateRemoteCompaction(model, attempt);
+			} catch (error) {
+				const nativeError = sanitizeCompactionError(error);
+				if (
+					attempt.requestedStrategy !== "auto" ||
+					nativeError.code === "aborted" ||
+					nativeError.code === "cancelled"
+				) {
+					throw nativeError;
+				}
+				this._throwIfCompactionAborted();
+				this._assertCompactionBranchUnchanged(attempt);
+				generated = {
+					...(await this._generateLocalCompaction(model, preparation, options, attempt)),
+					fallbackCode: nativeError.code,
+				};
+			}
+		}
+
+		attempt.phase = "pre_append";
+		this._throwIfCompactionAborted();
+		this._assertCompactionBranchUnchanged(attempt);
+		const metadata = this._createAttemptMetadata(attempt, options, model, generated);
+		const committedEntry = this._appendCompactionAttempt(attempt, generated, metadata);
+		attempt.committed = true;
+		attempt.phase = "committed";
+
+		attempt.phase = "rebuild";
+		this._rebuildCommittedCompaction(attempt.operationId);
+		attempt.phase = "committed";
+		const result = createSanitizedCompactionResult(committedEntry);
+		await this._extensionRunner.emit({
+			type: "session_compact",
+			compactionEntry: createSanitizedCompactionEntry(committedEntry),
+			fromExtension: generated.effectiveStrategy === "local" && generated.fromExtension,
+			reason: options.reason,
+			requestedStrategy: options.requestedStrategy ?? "local",
+			willRetry: options.willRetry,
+		});
+		this._emit({
+			type: "compaction_end",
+			reason: options.reason,
+			result,
+			aborted: false,
+			willRetry: options.willRetry,
+		});
+		return result;
+	}
+
+	/** 选择 Local 输入，绝不把 Opaque Provider Context 交给摘要模型。 */
+	private _getLocalCompactionEntries(
+		context: { messages: AgentMessage[]; providerContext?: unknown },
+		excludedEntryIds: ReadonlySet<string>,
+	): SessionEntry[] {
+		if (context.providerContext !== undefined || excludedEntryIds.size > 0) {
+			return this.sessionManager.buildPortableRawEntries(excludedEntryIds);
+		}
+		return this.sessionManager.getBranch();
+	}
+
+	/** 使用隔离的准备快照执行现有 Extension Hook。 */
+	private async _runCompactionHook(
+		preparation: CompactionPreparation,
+		activeEntries: SessionEntry[],
+		options: CompactionAttemptOptions,
+	): Promise<CompactionResult | undefined> {
+		if (!this._extensionRunner.hasHandlers("session_before_compact")) return undefined;
+		const result = (await this._extensionRunner.emit({
+			type: "session_before_compact",
+			preparation: structuredClone(preparation),
+			branchEntries: createExternalSessionEntries(activeEntries),
+			customInstructions: options.customInstructions,
+			reason: options.reason,
+			requestedStrategy: options.requestedStrategy ?? "local",
+			willRetry: options.willRetry,
+			signal: this._compactionAbortController!.signal,
+		})) as SessionBeforeCompactResult | undefined;
+		if (result?.cancel) throw new CompactionBoundaryError("cancelled");
+		return result?.compaction;
+	}
+
+	/** 在 Append 阶段前拒绝畸形或脱离当前分支的 Extension 结果。 */
+	private _validateExtensionCompaction(result: CompactionResult, localEntries: SessionEntry[]): CompactionResult {
+		if (
+			typeof result.summary !== "string" ||
+			typeof result.firstKeptEntryId !== "string" ||
+			!localEntries.some((entry) => entry.id === result.firstKeptEntryId) ||
+			typeof result.tokensBefore !== "number" ||
+			!Number.isFinite(result.tokensBefore) ||
+			result.tokensBefore < 0
+		) {
+			throw new CompactionBoundaryError("invalid_hook_result");
+		}
+		return {
+			summary: result.summary,
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: result.tokensBefore,
+			estimatedTokensAfter: result.estimatedTokensAfter,
+			usage: result.usage,
+			details: result.details,
+		};
+	}
+
+	/** 生成一次 Local 摘要但不提交。 */
+	private async _generateLocalCompaction(
+		model: Model<any>,
+		preparation: CompactionPreparation,
+		options: CompactionAttemptOptions,
+		attempt: ActiveCompactionAttempt,
+	): Promise<LocalGeneratedCompaction> {
+		this._activeCompactionAttempt!.phase = "local";
+		const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+		this._throwIfCompactionAborted();
+		this._assertCompactionBranchUnchanged(attempt);
+		const result = await compact(
+			preparation,
+			model,
+			apiKey,
+			headers,
+			options.customInstructions,
+			this._compactionAbortController!.signal,
+			this.thinkingLevel,
+			this.agent.streamFunction,
+			env,
+			this.settingsManager.getRetrySettings(),
+			this._summarizationRetryCallbacks({ source: "compaction", reason: options.reason }),
+		);
+		return { effectiveStrategy: "local", result, fromExtension: false };
+	}
+
+	/** 调用一次精确的 ModelRuntime Native 能力但不提交。 */
+	private async _generateRemoteCompaction(
+		model: Model<any>,
+		attempt: ActiveCompactionAttempt,
+	): Promise<RemoteGeneratedCompaction> {
+		this._activeCompactionAttempt!.phase = "native";
+		if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") {
+			throw createNativeCompactionError("unsupported");
+		}
+		const sessionContext = this.sessionManager.buildSessionContext();
+		const messages = await this.agent.convertToLlm(structuredClone(sessionContext.messages));
+		this._throwIfCompactionAborted();
+		this._assertCompactionBranchUnchanged(attempt);
+		const context: Context = {
+			systemPrompt: this.agent.state.systemPrompt,
+			messages,
+			tools: this.agent.state.tools.slice(),
+			...(sessionContext.providerContext === undefined ? {} : { providerContext: sessionContext.providerContext }),
+		};
+		const result = await this._modelRuntime.compact(model as Model<NativeCompactionApi>, context, {
+			signal: this._compactionAbortController!.signal,
+		});
+		this._throwIfCompactionAborted();
+		return {
+			effectiveStrategy: "remote",
+			result,
+			tokensBefore: result.usage?.inputTokens ?? estimateContextTokens(context.messages).tokens,
+		};
+	}
+
+	/** 构造两种 Checkpoint 共用的安全持久化 Metadata。 */
+	private _createAttemptMetadata(
+		attempt: ActiveCompactionAttempt,
+		options: CompactionAttemptOptions,
+		model: Model<any>,
+		generated: GeneratedCompaction,
+	): CompactionMetadata {
+		const tokensBefore =
+			generated.effectiveStrategy === "local" ? generated.result.tokensBefore : generated.tokensBefore;
+		const estimatedTokensAfter =
+			generated.effectiveStrategy === "local"
+				? this._estimateLocalCompactionTokensAfter(attempt, generated)
+				: undefined;
+		const usage = generated.result.usage;
+		const binding = generated.effectiveStrategy === "remote" ? generated.result.providerContext.binding : undefined;
+		return createCompactionMetadata({
+			attemptId: attempt.attemptId,
+			operationId: attempt.operationId,
+			reason: options.reason,
+			requestedStrategy: attempt.requestedStrategy,
+			effectiveStrategy: generated.effectiveStrategy,
+			protocol: binding?.protocol,
+			provider: binding?.provider ?? model.provider,
+			model: binding?.model ?? model.id,
+			tokensBefore,
+			estimatedTokensAfter,
+			usage,
+			fallbackCode: generated.effectiveStrategy === "local" ? generated.fallbackCode : undefined,
+		});
+	}
+
+	/** 在 Commit 前用同一 Entry 身份预演 Local 上下文，固定返回与持久化的 Token 估算。 */
+	private _estimateLocalCompactionTokensAfter(
+		attempt: ActiveCompactionAttempt,
+		generated: LocalGeneratedCompaction,
+	): number {
+		const previewEntry: CompactionEntry = {
+			type: "compaction",
+			id: attempt.entryId,
+			parentId: attempt.startingLeafId,
+			timestamp: attempt.entryTimestamp,
+			operationId: attempt.operationId,
+			summary: generated.result.summary,
+			firstKeptEntryId: generated.result.firstKeptEntryId,
+			tokensBefore: generated.result.tokensBefore,
+			details: generated.result.details,
+			usage: generated.result.usage,
+			fromHook: generated.fromExtension,
+		};
+		const preview = buildSessionContext([...this.sessionManager.getEntries(), previewEntry], previewEntry.id);
+		return estimateMessagesTokens(preview.messages);
+	}
+
+	/** 只 Append 一次；异常后按 Operation ID Reload/查询，不重新发送。 */
+	private _appendCompactionAttempt(
+		attempt: ActiveCompactionAttempt,
+		generated: GeneratedCompaction,
+		metadata: CompactionMetadata,
+	): CompactionEntry | RemoteCompactionEntry {
+		attempt.phase = "append";
+		try {
+			if (generated.effectiveStrategy === "remote") {
+				return this.sessionManager.appendRemoteCompaction({
+					entryId: attempt.entryId,
+					operationId: attempt.operationId,
+					timestamp: attempt.entryTimestamp,
+					summary: "",
+					tokensBefore: generated.tokensBefore,
+					usage: generated.result.usage,
+					providerContext: generated.result.providerContext,
+					metadata,
+				});
+			}
+			return this.sessionManager.appendCompactionTransaction({
+				entryId: attempt.entryId,
+				operationId: attempt.operationId,
+				timestamp: attempt.entryTimestamp,
+				summary: generated.result.summary,
+				firstKeptEntryId: generated.result.firstKeptEntryId,
+				tokensBefore: generated.result.tokensBefore,
+				details: generated.result.details,
+				usage: generated.result.usage,
+				fromHook: generated.fromExtension,
+				metadata,
+			});
+		} catch {
+			const committed = this._reloadAndFindCompaction(attempt.operationId);
+			const expectedType = generated.effectiveStrategy === "remote" ? "remote_compaction" : "compaction";
+			if (committed?.id === attempt.entryId && committed.type === expectedType) return committed;
+			throw new CompactionBoundaryError("commit_indeterminate");
+		}
+	}
+
+	/** Append 结果不确定时 Reload 持久 Session，再查询稳定 Operation ID。 */
+	private _reloadAndFindCompaction(operationId: string): CompactionEntry | RemoteCompactionEntry | undefined {
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile) return this.sessionManager.findCompactionByOperationId(operationId);
+		try {
+			this.sessionManager.setSessionFile(sessionFile);
+			return this.sessionManager.findCompactionByOperationId(operationId);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** 已提交上下文最多重建两次；第二次失败必须明确属于提交后错误。 */
+	private _rebuildCommittedCompaction(operationId: string): void {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				if (attempt === 1) {
+					const sessionFile = this.sessionManager.getSessionFile();
+					if (sessionFile) this.sessionManager.setSessionFile(sessionFile);
+				}
+				const rebuilt = this.sessionManager.buildSessionContext();
+				this.agent.replaceContext({
+					messages: structuredClone(rebuilt.messages),
+					...(rebuilt.providerContext === undefined ? {} : { providerContext: rebuilt.providerContext }),
+				});
+				return;
+			} catch {
+				if (!this.sessionManager.findCompactionByOperationId(operationId)) break;
+			}
+		}
+		throw new CompactionBoundaryError("committed_restart_required");
+	}
+
+	private _throwIfCompactionAborted(): void {
+		if (this._compactionAbortController?.signal.aborted) throw createNativeCompactionError("aborted");
+	}
+
+	private _assertCompactionBranchUnchanged(attempt: ActiveCompactionAttempt): void {
+		if (this.sessionManager.getLeafId() !== attempt.startingLeafId) {
+			throw new CompactionBoundaryError("stale_branch");
 		}
 	}
 
@@ -2119,6 +2455,7 @@ export class AgentSession {
 					branchEntries: createExternalSessionEntries(pathEntries),
 					customInstructions: undefined,
 					reason,
+					requestedStrategy: "local",
 					willRetry,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -2203,6 +2540,7 @@ export class AgentSession {
 					compactionEntry: createSanitizedCompactionEntry(savedCompactionEntry, { reason }),
 					fromExtension,
 					reason,
+					requestedStrategy: "local",
 					willRetry,
 				});
 			}
@@ -2466,11 +2804,24 @@ export class AgentSession {
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
 					void (async () => {
+						let result: SanitizedCompactionResult;
 						try {
-							const result = await this.compact(options?.customInstructions);
-							options?.onComplete?.(createSanitizedCompactionResult(result, { reason: "manual" }));
+							result = await this.compact({
+								requestedStrategy: options?.requestedStrategy,
+								customInstructions: options?.customInstructions,
+							});
 						} catch (error) {
-							options?.onError?.(sanitizeCompactionError(error));
+							try {
+								options?.onError?.(sanitizeCompactionError(error));
+							} catch {
+								// Extension 回调不能产生未处理的异步拒绝。
+							}
+							return;
+						}
+						try {
+							options?.onComplete?.(result);
+						} catch {
+							// 成功通知不是事务的一部分，不能把已提交结果改写成失败。
 						}
 					})();
 				},

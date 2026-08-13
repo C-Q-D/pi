@@ -222,13 +222,32 @@ describe("Models native compaction preflight", () => {
 			messages: [
 				{ role: "user", content: "hello", timestamp: 1 },
 				{
+					role: "assistant",
+					content: [{ type: "text", text: "working", textSignature: undefined }],
+					api: "openai-responses",
+					provider: "public",
+					model: "gpt-test",
+					responseId: undefined,
+					errorMessage: undefined,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+				{
 					role: "toolResult",
 					toolCallId: "call-1",
 					toolName: "lookup",
 					content: [{ type: "text", text: "done" }],
 					details: new Date(),
 					isError: false,
-					timestamp: 2,
+					timestamp: 3,
 				},
 			],
 			tools: [{ name: "lookup", description: "Lookup", parameters: Type.Object({ query: Type.String() }) }],
@@ -247,7 +266,13 @@ describe("Models native compaction preflight", () => {
 		});
 		expect(Object.isFrozen(request)).toBe(true);
 		expect(Object.isFrozen(request.context.messages)).toBe(true);
-		expect("details" in request.context.messages[1]!).toBe(false);
+		const assistant = request.context.messages[1]!;
+		expect(assistant.role).toBe("assistant");
+		if (assistant.role !== "assistant") throw new Error("Expected canonical assistant message");
+		expect("responseId" in assistant).toBe(false);
+		expect("errorMessage" in assistant).toBe(false);
+		expect("textSignature" in assistant.content[0]!).toBe(false);
+		expect("details" in request.context.messages[2]!).toBe(false);
 		expect(Reflect.ownKeys(request.context.tools![0]!.parameters)).not.toContain("~kind");
 		expect(result.providerContext.binding).toEqual(request.binding);
 	});

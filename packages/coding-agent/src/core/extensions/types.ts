@@ -51,6 +51,7 @@ import type {
 	CompactionPreparation,
 	CompactionResult,
 	ExternalSessionEntry,
+	RequestedCompactionStrategy,
 	SanitizedCompactionEntry,
 	SanitizedCompactionResult,
 } from "../compaction/index.ts";
@@ -299,6 +300,8 @@ export interface ContextUsage {
 }
 
 export interface CompactOptions {
+	/** 本次请求的策略；持久化设置接入前默认 Local。 */
+	requestedStrategy?: RequestedCompactionStrategy;
 	customInstructions?: string;
 	onComplete?: (result: SanitizedCompactionResult) => void;
 	onError?: (error: Error) => void;
@@ -601,6 +604,8 @@ export interface SessionBeforeCompactEvent {
 	customInstructions?: string;
 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
 	reason: "manual" | "threshold" | "overflow";
+	/** Hook 运行前已经选择的请求策略。 */
+	requestedStrategy: RequestedCompactionStrategy;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	signal: AbortSignal;
@@ -613,6 +618,8 @@ export interface SessionCompactEvent {
 	fromExtension: boolean;
 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
 	reason: "manual" | "threshold" | "overflow";
+	/** Hook 与回退前选择的请求策略。 */
+	requestedStrategy: RequestedCompactionStrategy;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 }
