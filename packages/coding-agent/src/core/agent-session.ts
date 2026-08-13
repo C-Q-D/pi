@@ -77,6 +77,7 @@ import {
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	isRequestedCompactionStrategy,
 	prepareCompaction,
 	type RequestedCompactionStrategy,
 	type SanitizedCompactionResult,
@@ -1898,9 +1899,20 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<SanitizedCompactionResult>;
 	async compact(options?: CompactOptions): Promise<SanitizedCompactionResult>;
 	async compact(input?: string | CompactOptions): Promise<SanitizedCompactionResult> {
+		const requestedStrategy =
+			typeof input === "string"
+				? "local"
+				: input?.requestedStrategy !== undefined
+					? input.requestedStrategy
+					: input?.customInstructions !== undefined
+						? "local"
+						: this.compactionStrategy;
+		if (!isRequestedCompactionStrategy(requestedStrategy)) {
+			throw new CompactionBoundaryError("invalid_context");
+		}
 		const options: CompactionAttemptOptions = {
 			reason: "manual",
-			requestedStrategy: typeof input === "string" ? "local" : (input?.requestedStrategy ?? "local"),
+			requestedStrategy,
 			customInstructions: typeof input === "string" ? input : input?.customInstructions,
 			excludedEntryIds: new Set(),
 			willRetry: false,
@@ -2605,6 +2617,16 @@ export class AgentSession {
 	/** Whether auto-compaction is enabled */
 	get autoCompactionEnabled(): boolean {
 		return this.settingsManager.getCompactionEnabled();
+	}
+
+	/** Default strategy used by manual compaction calls that do not specify one. */
+	get compactionStrategy(): RequestedCompactionStrategy {
+		return this.settingsManager.getCompactionStrategy();
+	}
+
+	/** Persist the default compaction strategy. */
+	setCompactionStrategy(strategy: RequestedCompactionStrategy): void {
+		this.settingsManager.setCompactionStrategy(strategy);
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {

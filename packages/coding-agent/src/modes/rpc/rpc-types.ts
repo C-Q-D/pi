@@ -12,6 +12,7 @@ import type { BashResult } from "../../core/bash-executor.ts";
 import type {
 	ExternalSessionEntry,
 	ExternalSessionTreeNode,
+	RequestedCompactionStrategy,
 	SanitizedCompactionResult,
 } from "../../core/compaction/index.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
@@ -48,6 +49,7 @@ export type RpcCommand =
 	// Compaction
 	| { id?: string; type: "compact"; customInstructions?: string }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+	| { id?: string; type: "set_compaction_strategy"; strategy: RequestedCompactionStrategy }
 
 	// Retry
 	| { id?: string; type: "set_auto_retry"; enabled: boolean }
@@ -106,6 +108,7 @@ export interface RpcSessionState {
 	sessionId: string;
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
+	compactionStrategy: RequestedCompactionStrategy;
 	messageCount: number;
 	pendingMessageCount: number;
 }
@@ -173,6 +176,7 @@ export type RpcResponse =
 	// Compaction
 	| { id?: string; type: "response"; command: "compact"; success: true; data: SanitizedCompactionResult }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
+	| { id?: string; type: "response"; command: "set_compaction_strategy"; success: true }
 
 	// Retry
 	| { id?: string; type: "response"; command: "set_auto_retry"; success: true }

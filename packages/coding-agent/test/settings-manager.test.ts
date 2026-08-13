@@ -232,6 +232,95 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("compaction strategy", () => {
+		it("defaults to Local and respects the existing global/project merge", () => {
+			const defaults = SettingsManager.create(projectDir, agentDir);
+			expect(defaults.getCompactionStrategy()).toBe("local");
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ compaction: { strategy: "remote" } }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ compaction: { strategy: "auto" } }));
+			const merged = SettingsManager.create(projectDir, agentDir);
+
+			expect(merged.getCompactionStrategy()).toBe("auto");
+		});
+
+		it("persists, reloads, and applies in-memory overrides", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setCompactionStrategy("auto");
+			await manager.flush();
+
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).compaction.strategy).toBe("auto");
+
+			writeFileSync(settingsPath, JSON.stringify({ compaction: { strategy: "remote" } }));
+			await manager.reload();
+			expect(manager.getCompactionStrategy()).toBe("remote");
+
+			manager.applyOverrides({ compaction: { strategy: "auto" } });
+			expect(manager.getCompactionStrategy()).toBe("auto");
+		});
+
+		it("diagnoses an invalid persisted value, falls back to Local, and does not rewrite until set", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const invalidStrategy = "bad\u001b]0;PRIVATE_TITLE\u0007\nPRIVATE_LINE";
+			const invalidJson = JSON.stringify({ compaction: { strategy: invalidStrategy }, theme: "dark" }, null, 2);
+			writeFileSync(settingsPath, invalidJson);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const errors = manager.drainErrors();
+
+			expect(manager.getCompactionStrategy()).toBe("local");
+			expect(errors).toEqual([
+				expect.objectContaining({
+					scope: "global",
+					error: expect.objectContaining({
+						message: "Invalid compaction.strategy setting; using local",
+					}),
+				}),
+			]);
+			expect(JSON.stringify(errors)).not.toContain("PRIVATE_TITLE");
+			expect(JSON.stringify(errors)).not.toContain("PRIVATE_LINE");
+			expect(readFileSync(settingsPath, "utf-8")).toBe(invalidJson);
+
+			manager.setCompactionStrategy("remote");
+			await manager.flush();
+			expect(manager.getCompactionStrategy()).toBe("remote");
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).compaction.strategy).toBe("remote");
+		});
+
+		it("lets an invalid project override fail closed to Local without discarding valid global settings", () => {
+			const globalPath = join(agentDir, "settings.json");
+			const projectPath = join(projectDir, ".pi", "settings.json");
+			writeFileSync(globalPath, JSON.stringify({ compaction: { strategy: "remote" }, theme: "dark" }));
+			writeFileSync(projectPath, JSON.stringify({ compaction: { strategy: "invalid-project" } }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getCompactionStrategy()).toBe("local");
+			expect(manager.getTheme()).toBe("dark");
+			expect(manager.drainErrors()).toEqual([
+				expect.objectContaining({
+					scope: "project",
+					error: expect.objectContaining({
+						message: "Invalid compaction.strategy setting; using local",
+					}),
+				}),
+			]);
+			expect(JSON.parse(readFileSync(projectPath, "utf-8")).compaction.strategy).toBe("invalid-project");
+		});
+
+		it("rejects invalid setter input without changing the last valid value", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setCompactionStrategy("remote");
+			await manager.flush();
+
+			expect(() => manager.setCompactionStrategy("invalid" as "local")).toThrow("Invalid compaction strategy");
+			expect(manager.getCompactionStrategy()).toBe("remote");
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).compaction.strategy).toBe("remote");
+		});
+	});
+
 	describe("project trust", () => {
 		it("should skip project settings when project is not trusted", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "global" }));

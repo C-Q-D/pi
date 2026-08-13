@@ -47,6 +47,7 @@ export {
 	generateSummaryWithUsage,
 	getLastAssistantUsage,
 	prepareBranchEntries,
+	type RequestedCompactionStrategy,
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";

@@ -12,6 +12,7 @@ import type { BashResult } from "../../core/bash-executor.ts";
 import type {
 	ExternalSessionEntry,
 	ExternalSessionTreeNode,
+	RequestedCompactionStrategy,
 	SanitizedCompactionResult,
 } from "../../core/compaction/index.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -318,6 +319,11 @@ export class RpcClient {
 	 */
 	async setAutoCompaction(enabled: boolean): Promise<void> {
 		await this.send({ type: "set_auto_compaction", enabled });
+	}
+
+	/** Set the persistent default compaction strategy. */
+	async setCompactionStrategy(strategy: RequestedCompactionStrategy): Promise<void> {
+		await this.send({ type: "set_compaction_strategy", strategy });
 	}
 
 	/**

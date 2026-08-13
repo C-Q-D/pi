@@ -15,8 +15,8 @@ beforeAll(() => {
 
 describe("/compact strategy arguments", () => {
 	test.each([
-		[undefined, { requestedStrategy: "local" }],
-		["", { requestedStrategy: "local" }],
+		[undefined, {}],
+		["", {}],
 		["focus on decisions", { requestedStrategy: "local", customInstructions: "focus on decisions" }],
 		["focus on --remote behavior", { requestedStrategy: "local", customInstructions: "focus on --remote behavior" }],
 		["--local", { requestedStrategy: "local" }],
@@ -67,6 +67,7 @@ describe("/compact strategy arguments", () => {
 	});
 
 	test.each([
+		["", {}],
 		["--remote", { requestedStrategy: "remote" }],
 		["--local focus on decisions", { requestedStrategy: "local", customInstructions: "focus on decisions" }],
 		["legacy instructions", { requestedStrategy: "local", customInstructions: "legacy instructions" }],
@@ -86,6 +87,86 @@ describe("/compact strategy arguments", () => {
 		expect(fakeThis.session.compact).toHaveBeenCalledTimes(1);
 		expect(fakeThis.session.compact).toHaveBeenCalledWith(options);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
+	});
+
+	test("preserves empty legacy instructions through the Interactive shortcut facade", async () => {
+		let markComplete: (() => void) | undefined;
+		const completed = new Promise<void>((resolve) => {
+			markComplete = resolve;
+		});
+		const compact = vi.fn().mockResolvedValue(
+			createSanitizedCompactionResult({
+				type: "compaction",
+				summary: "local",
+				tokensBefore: 10,
+				metadata: {
+					requestedStrategy: "local",
+					effectiveStrategy: "local",
+					tokensBefore: 10,
+					experimental: true,
+				},
+			}),
+		);
+		const defaultEditor: { onExtensionShortcut?: (data: string) => void } = {};
+		const fakeThis = {
+			keybindings: { getEffectiveConfig: () => ({}) },
+			sessionManager: {
+				getCwd: () => "F:/tmp",
+				getSessionDir: () => "F:/tmp",
+				getSessionId: () => "session",
+				getSessionFile: () => undefined,
+				getLeafId: () => null,
+				getLeafEntry: () => undefined,
+				getEntry: () => undefined,
+				getLabel: () => undefined,
+				getBranch: () => [],
+				buildContextEntries: () => [],
+				buildPortableRawEntries: () => [],
+				getHeader: () => null,
+				getEntries: () => [],
+				getTree: () => [],
+				getSessionName: () => undefined,
+			},
+			createExtensionUIContext: () => ({}),
+			session: {
+				model: undefined,
+				scopedModels: [],
+				thinkingLevel: "medium",
+				isIdle: true,
+				agent: { signal: undefined },
+				compact,
+				getContextUsage: () => undefined,
+				systemPrompt: "test",
+			},
+			settingsManager: { isProjectTrusted: () => true },
+			restoreQueuedMessagesToEditor: vi.fn(),
+			shutdownRequested: false,
+			defaultEditor,
+		};
+		const extensionRunner = {
+			getShortcuts: () =>
+				new Map([
+					[
+						"ctrl+x",
+						{
+							handler: (ctx: { compact: (options: object) => void }) => {
+								ctx.compact({ customInstructions: "", onComplete: () => markComplete?.() });
+							},
+						},
+					],
+				]),
+			getModelRegistry: () => ({}),
+		};
+		const setupExtensionShortcuts = Reflect.get(InteractiveMode.prototype, "setupExtensionShortcuts") as (
+			this: typeof fakeThis,
+			runner: typeof extensionRunner,
+		) => void;
+
+		setupExtensionShortcuts.call(fakeThis, extensionRunner);
+		defaultEditor.onExtensionShortcut?.("\x18");
+		await completed;
+
+		expect(compact).toHaveBeenCalledWith({ requestedStrategy: undefined, customInstructions: "" });
 	});
 });
 

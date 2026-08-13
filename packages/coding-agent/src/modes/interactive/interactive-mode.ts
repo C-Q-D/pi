@@ -217,7 +217,7 @@ const COMPACT_COMMAND_USAGE = "Usage: /compact [--local [instructions] | --remot
 /** 解析 `/compact` 参数；任何错误都在创建 Compaction Attempt 前返回。 */
 export function parseCompactCommandArguments(rawArguments?: string): CompactCommandParseResult {
 	const input = rawArguments?.trim() ?? "";
-	if (!input) return { ok: true, options: { requestedStrategy: "local" } };
+	if (!input) return { ok: true, options: {} };
 	if (!input.startsWith("--")) {
 		return { ok: true, options: { requestedStrategy: "local", customInstructions: input } };
 	}
@@ -4235,6 +4235,7 @@ export class InteractiveMode {
 			const selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					compactionStrategy: this.session.compactionStrategy,
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -4269,6 +4270,10 @@ export class InteractiveMode {
 					onAutoCompactChange: (enabled) => {
 						this.session.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					onCompactionStrategyChange: (strategy) => {
+						this.session.setCompactionStrategy(strategy);
+						this.showStatus(`Compaction strategy: ${strategy}`);
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);

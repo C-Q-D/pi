@@ -144,4 +144,27 @@ describe("SettingsManager - External Edit Preservation", () => {
 		const savedProjectSettings = JSON.parse(readFileSync(projectSettingsPath, "utf-8"));
 		expect(savedProjectSettings.extensions).toEqual(["./in-memory-extension.ts"]);
 	});
+
+	it("should preserve external compaction fields when only the strategy is changed", async () => {
+		const settingsPath = join(agentDir, "settings.json");
+		writeFileSync(
+			settingsPath,
+			JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 } }),
+		);
+		const manager = SettingsManager.create(projectDir, agentDir);
+
+		writeFileSync(
+			settingsPath,
+			JSON.stringify({ compaction: { enabled: false, reserveTokens: 32_000, keepRecentTokens: 8_000 } }),
+		);
+		manager.setCompactionStrategy("auto");
+		await manager.flush();
+
+		expect(JSON.parse(readFileSync(settingsPath, "utf-8")).compaction).toEqual({
+			enabled: false,
+			reserveTokens: 32_000,
+			keepRecentTokens: 8_000,
+			strategy: "auto",
+		});
+	});
 });

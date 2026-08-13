@@ -15,6 +15,11 @@ export type CompactionReason = "manual" | "threshold" | "overflow";
 /** 用户请求的压缩策略。 */
 export type RequestedCompactionStrategy = "local" | "remote" | "auto";
 
+/** Runtime boundary shared by settings, RPC, and extension-facing inputs. */
+export function isRequestedCompactionStrategy(value: unknown): value is RequestedCompactionStrategy {
+	return value === "local" || value === "remote" || value === "auto";
+}
+
 /** 本次实际采用的压缩策略。 */
 export type EffectiveCompactionStrategy = "local" | "remote";
 

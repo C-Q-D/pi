@@ -11,7 +11,11 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession, AgentSessionEvent, CompactOptions } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { CompactionBoundaryError, type SanitizedCompactionResult } from "../src/core/compaction/index.ts";
+import {
+	CompactionBoundaryError,
+	type RequestedCompactionStrategy,
+	type SanitizedCompactionResult,
+} from "../src/core/compaction/index.ts";
 import type { ExtensionFactory } from "../src/core/extensions/index.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -30,6 +34,7 @@ interface HarnessOptions {
 	readonly persistent?: boolean;
 	readonly extension?: ExtensionFactory;
 	readonly provider?: string;
+	readonly strategy?: RequestedCompactionStrategy;
 }
 
 interface Harness {
@@ -84,7 +89,7 @@ describe("AgentSession manual remote compaction transaction", () => {
 		});
 		sessionManager.appendMessage(fauxAssistantMessage("raw assistant context"));
 		sessionManager.appendMessage({ role: "user", content: "raw tail", timestamp: 2 });
-		const settingsManager = SettingsManager.inMemory();
+		const settingsManager = SettingsManager.inMemory({ compaction: { strategy: options.strategy } });
 		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1, reserveTokens: 1_000 } });
 		const extensionsResult = options.extension
 			? await createTestExtensionsResult([options.extension], tempDir)
@@ -243,6 +248,57 @@ describe("AgentSession manual remote compaction transaction", () => {
 		expect(automatic.faux.nativeCompaction!.state.compactCallCount).toBe(1);
 		expect(automatic.faux.state.callCount).toBe(1);
 		expect(automatic.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+	});
+
+	it("uses the configured strategy only for truly optionless manual calls", async () => {
+		const configured = await createHarness({ strategy: "remote" });
+		configured.faux.nativeCompaction!.setResults([nativeResult("configured-remote")]);
+
+		const remote = await configured.session.compact();
+
+		expect(remote.metadata).toMatchObject({ requestedStrategy: "remote", effectiveStrategy: "remote" });
+		expect(configured.faux.nativeCompaction!.state.compactCallCount).toBe(1);
+
+		const legacy = await createHarness({ strategy: "remote" });
+		legacy.faux.setResponses([fauxAssistantMessage("legacy local summary")]);
+
+		const local = await legacy.session.compact({ customInstructions: "" });
+
+		expect(local.metadata).toMatchObject({ requestedStrategy: "local", effectiveStrategy: "local" });
+		expect(legacy.faux.nativeCompaction!.state.compactCallCount).toBe(0);
+		expect(legacy.faux.state.callCount).toBe(1);
+	});
+
+	it("keeps legacy Extension custom instructions Local when the configured strategy is Auto", async () => {
+		let observedResult: SanitizedCompactionResult | undefined;
+		let markSettled: (() => void) | undefined;
+		const settled = new Promise<void>((resolve) => {
+			markSettled = resolve;
+		});
+		const extension: ExtensionFactory = (pi) => {
+			pi.registerCommand("legacy-local-compact", {
+				description: "Exercise legacy custom instructions",
+				handler: async (_args, ctx) => {
+					ctx.compact({
+						customInstructions: "focus on durable decisions",
+						onComplete: (result) => {
+							observedResult = result;
+							markSettled?.();
+						},
+						onError: () => markSettled?.(),
+					});
+				},
+			});
+		};
+		const { session, faux } = await createHarness({ strategy: "auto", extension });
+		faux.setResponses([fauxAssistantMessage("extension local summary")]);
+
+		await session.prompt("/legacy-local-compact");
+		await settled;
+
+		expect(observedResult?.metadata).toMatchObject({ requestedStrategy: "local", effectiveStrategy: "local" });
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(0);
+		expect(faux.state.callCount).toBe(1);
 	});
 
 	it("rejects a Remote custom hook result before provider dispatch but lets Auto accept it as Local", async () => {

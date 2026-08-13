@@ -17,6 +17,7 @@ import {
 	createExternalSessionEntries,
 	createExternalSessionTree,
 	createSanitizedCompactionResult,
+	isRequestedCompactionStrategy,
 } from "../../core/compaction/index.ts";
 import type {
 	ExtensionUIContext,
@@ -459,6 +460,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
+					compactionStrategy: session.compactionStrategy,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
 				};
@@ -533,6 +535,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "compact": {
+				if (command.customInstructions !== undefined && typeof command.customInstructions !== "string") {
+					return error(id, "compact", "Invalid compact customInstructions");
+				}
 				const result = await session.compact(command.customInstructions);
 				return success(id, "compact", createSanitizedCompactionResult(result, { reason: "manual" }));
 			}
@@ -540,6 +545,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "set_auto_compaction": {
 				session.setAutoCompactionEnabled(command.enabled);
 				return success(id, "set_auto_compaction");
+			}
+
+			case "set_compaction_strategy": {
+				if (!isRequestedCompactionStrategy(command.strategy)) {
+					return error(id, "set_compaction_strategy", "Invalid compaction strategy");
+				}
+				session.setCompactionStrategy(command.strategy);
+				return success(id, "set_compaction_strategy");
 			}
 
 			// =================================================================

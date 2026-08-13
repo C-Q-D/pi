@@ -12,6 +12,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import type { RequestedCompactionStrategy } from "../../../core/compaction/index.ts";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
 import type { DefaultProjectTrust, WarningSettings } from "../../../core/settings-manager.ts";
 import {
@@ -51,6 +52,7 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	compactionStrategy: RequestedCompactionStrategy;
 	showImages: boolean;
 	imageWidthCells: number;
 	autoResizeImages: boolean;
@@ -84,6 +86,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onCompactionStrategyChange: (strategy: RequestedCompactionStrategy) => void;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -488,6 +491,13 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "compaction-strategy",
+				label: "Compaction strategy",
+				description: "Default for manual compaction; Remote and Auto are experimental and binding-specific",
+				currentValue: config.compactionStrategy,
+				values: ["local", "remote", "auto"],
+			},
+			{
 				id: "steering-mode",
 				label: "Steering mode",
 				description:
@@ -739,6 +749,9 @@ export class SettingsSelectorComponent extends Container {
 				switch (id) {
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
+						break;
+					case "compaction-strategy":
+						callbacks.onCompactionStrategyChange(newValue as RequestedCompactionStrategy);
 						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");

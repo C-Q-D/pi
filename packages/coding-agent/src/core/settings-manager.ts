@@ -6,12 +6,14 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { isRequestedCompactionStrategy, type RequestedCompactionStrategy } from "./compaction/metadata.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	strategy?: RequestedCompactionStrategy; // default: "local"
 }
 
 export interface BranchSummarySettings {
@@ -168,6 +170,14 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
 		throw new Error(`Invalid ${settingName} setting: ${String(value)}`);
 	}
 	return undefined;
+}
+
+function getSettingsDiagnostics(settings: Settings): Error[] {
+	const strategy = (settings.compaction as { strategy?: unknown } | undefined)?.strategy;
+	if (strategy === undefined || isRequestedCompactionStrategy(strategy)) {
+		return [];
+	}
+	return [new Error("Invalid compaction.strategy setting; using local")];
 }
 
 export type SettingsScope = "global" | "project";
@@ -327,6 +337,12 @@ export class SettingsManager {
 		if (projectLoad.error) {
 			initialErrors.push({ scope: "project", error: projectLoad.error });
 		}
+		for (const diagnostic of globalLoad.diagnostics) {
+			initialErrors.push({ scope: "global", error: diagnostic });
+		}
+		for (const diagnostic of projectLoad.diagnostics) {
+			initialErrors.push({ scope: "project", error: diagnostic });
+		}
 
 		return new SettingsManager(
 			storage,
@@ -369,11 +385,12 @@ export class SettingsManager {
 		storage: SettingsStorage,
 		scope: SettingsScope,
 		projectTrusted = true,
-	): { settings: Settings; error: Error | null } {
+	): { settings: Settings; error: Error | null; diagnostics: Error[] } {
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
+			const settings = SettingsManager.loadFromStorage(storage, scope, projectTrusted);
+			return { settings, error: null, diagnostics: getSettingsDiagnostics(settings) };
 		} catch (error) {
-			return { settings: {}, error: error as Error };
+			return { settings: {}, error: error as Error, diagnostics: [] };
 		}
 	}
 
@@ -473,6 +490,9 @@ export class SettingsManager {
 		if (projectLoad.error) {
 			this.recordError("project", projectLoad.error);
 		}
+		for (const diagnostic of projectLoad.diagnostics) {
+			this.recordError("project", diagnostic);
+		}
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
@@ -485,6 +505,9 @@ export class SettingsManager {
 		} else {
 			this.globalSettingsLoadError = globalLoad.error;
 			this.recordError("global", globalLoad.error);
+		}
+		for (const diagnostic of globalLoad.diagnostics) {
+			this.recordError("global", diagnostic);
 		}
 
 		this.modifiedFields.clear();
@@ -499,6 +522,9 @@ export class SettingsManager {
 		} else {
 			this.projectSettingsLoadError = projectLoad.error;
 			this.recordError("project", projectLoad.error);
+		}
+		for (const diagnostic of projectLoad.diagnostics) {
+			this.recordError("project", diagnostic);
 		}
 
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
@@ -767,6 +793,23 @@ export class SettingsManager {
 		}
 		this.globalSettings.compaction.enabled = enabled;
 		this.markModified("compaction", "enabled");
+		this.save();
+	}
+
+	getCompactionStrategy(): RequestedCompactionStrategy {
+		const strategy = (this.settings.compaction as { strategy?: unknown } | undefined)?.strategy;
+		return isRequestedCompactionStrategy(strategy) ? strategy : "local";
+	}
+
+	setCompactionStrategy(strategy: RequestedCompactionStrategy): void {
+		if (!isRequestedCompactionStrategy(strategy)) {
+			throw new Error("Invalid compaction strategy");
+		}
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.strategy = strategy;
+		this.markModified("compaction", "strategy");
 		this.save();
 	}
 
