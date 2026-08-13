@@ -60,6 +60,7 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { createSanitizedCompactionResult, sanitizeCompactionError } from "../../core/compaction/index.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -1820,10 +1821,9 @@ export class InteractiveMode {
 				void (async () => {
 					try {
 						const result = await this.session.compact(options?.customInstructions);
-						options?.onComplete?.(result);
+						options?.onComplete?.(createSanitizedCompactionResult(result, { reason: "manual" }));
 					} catch (error) {
-						const err = error instanceof Error ? error : new Error(String(error));
-						options?.onError?.(err);
+						options?.onError?.(sanitizeCompactionError(error));
 					}
 				})();
 			},

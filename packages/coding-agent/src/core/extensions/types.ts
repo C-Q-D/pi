@@ -47,7 +47,13 @@ import type {
 import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
-import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type {
+	CompactionPreparation,
+	CompactionResult,
+	ExternalSessionEntry,
+	SanitizedCompactionEntry,
+	SanitizedCompactionResult,
+} from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -57,7 +63,6 @@ import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type {
 	BranchSummaryEntry,
-	CompactionEntry,
 	CustomEntry,
 	ReadonlySessionManager,
 	SessionEntry,
@@ -295,7 +300,7 @@ export interface ContextUsage {
 
 export interface CompactOptions {
 	customInstructions?: string;
-	onComplete?: (result: CompactionResult) => void;
+	onComplete?: (result: SanitizedCompactionResult) => void;
 	onError?: (error: Error) => void;
 }
 
@@ -592,7 +597,7 @@ export interface SessionBeforeForkEvent {
 export interface SessionBeforeCompactEvent {
 	type: "session_before_compact";
 	preparation: CompactionPreparation;
-	branchEntries: SessionEntry[];
+	branchEntries: ExternalSessionEntry[];
 	customInstructions?: string;
 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
 	reason: "manual" | "threshold" | "overflow";
@@ -604,7 +609,7 @@ export interface SessionBeforeCompactEvent {
 /** Fired after context compaction */
 export interface SessionCompactEvent {
 	type: "session_compact";
-	compactionEntry: CompactionEntry;
+	compactionEntry: SanitizedCompactionEntry;
 	fromExtension: boolean;
 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
 	reason: "manual" | "threshold" | "overflow";
@@ -635,10 +640,16 @@ export interface TreePreparation {
 	label?: string;
 }
 
+/** Extension 可见的 Tree Preparation，不包含原始压缩 Entry Payload。 */
+export interface ExternalTreePreparation extends Omit<TreePreparation, "entriesToSummarize"> {
+	/** 经过压缩元数据边界净化的待总结 Entry。 */
+	entriesToSummarize: ExternalSessionEntry[];
+}
+
 /** Fired before navigating in the session tree (can be cancelled) */
 export interface SessionBeforeTreeEvent {
 	type: "session_before_tree";
-	preparation: TreePreparation;
+	preparation: ExternalTreePreparation;
 	signal: AbortSignal;
 }
 

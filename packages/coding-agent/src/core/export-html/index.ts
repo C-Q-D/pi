@@ -4,6 +4,7 @@ import { basename, join } from "path";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.ts";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
+import { createExternalSessionEntries, type ExternalSessionEntry } from "../compaction/index.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import type { SessionEntry } from "../session-manager.ts";
 import { SessionManager } from "../session-manager.ts";
@@ -129,7 +130,7 @@ function generateThemeVars(themeName?: string): string {
 
 interface SessionData {
 	header: ReturnType<SessionManager["getHeader"]>;
-	entries: ReturnType<SessionManager["getEntries"]>;
+	entries: ExternalSessionEntry[];
 	leafId: string | null;
 	systemPrompt?: string;
 	tools?: Array<Pick<ToolDefinition, "name" | "description" | "parameters">>;
@@ -262,7 +263,7 @@ export async function exportSessionToHtml(
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries,
+		entries: createExternalSessionEntries(entries),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt,
 		tools: state?.tools?.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
@@ -297,7 +298,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries: sm.getEntries(),
+		entries: createExternalSessionEntries(sm.getEntries()),
 		leafId: sm.getLeafId(),
 		systemPrompt: undefined,
 		tools: undefined,

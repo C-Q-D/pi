@@ -13,6 +13,11 @@
 
 import * as crypto from "node:crypto";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import {
+	createExternalSessionEntries,
+	createExternalSessionTree,
+	createSanitizedCompactionResult,
+} from "../../core/compaction/index.ts";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -529,7 +534,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "compact": {
 				const result = await session.compact(command.customInstructions);
-				return success(id, "compact", result);
+				return success(id, "compact", createSanitizedCompactionResult(result, { reason: "manual" }));
 			}
 
 			case "set_auto_compaction": {
@@ -640,12 +645,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					}
 					entries = entries.slice(sinceIndex + 1);
 				}
-				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+				return success(id, "get_entries", {
+					entries: createExternalSessionEntries(entries),
+					leafId: sessionManager.getLeafId(),
+				});
 			}
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
-				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
+				return success(id, "get_tree", {
+					tree: createExternalSessionTree(sessionManager.getTree()),
+					leafId: sessionManager.getLeafId(),
+				});
 			}
 
 			case "get_last_assistant_text": {

@@ -12,6 +12,11 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import {
+	createExternalSessionTree,
+	type ExternalSessionEntry,
+	type ExternalSessionTreeNode,
+} from "../../../core/compaction/index.ts";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -25,7 +30,7 @@ interface GutterInfo {
 
 /** Flattened tree node for navigation */
 interface FlatNode {
-	node: SessionTreeNode;
+	node: DisplaySessionTreeNode;
 	/** Indentation level (each level = 3 chars) */
 	indent: number;
 	/** Whether to show connector (├─ or └─) - true if parent has multiple children */
@@ -36,6 +41,39 @@ interface FlatNode {
 	gutters: GutterInfo[];
 	/** True if this node is a root under a virtual branching root (multiple roots) */
 	isVirtualRootChild: boolean;
+}
+
+/** TreeSelector 内部可更新标签、但 Entry 已净化的展示节点。 */
+interface DisplaySessionTreeNode {
+	/** 只包含安全压缩元数据的 Entry。 */
+	entry: ExternalSessionEntry;
+	/** 可导航的子节点。 */
+	children: DisplaySessionTreeNode[];
+	/** 当前标签。 */
+	label?: string;
+	/** 最近标签更新时间。 */
+	labelTimestamp?: string;
+}
+
+/** 从冻结的外部 DTO 创建仅供界面维护选择状态的可变节点。 */
+function createDisplaySessionTree(nodes: readonly ExternalSessionTreeNode[]): DisplaySessionTreeNode[] {
+	const createNode = (node: ExternalSessionTreeNode): DisplaySessionTreeNode => ({
+		entry: node.entry,
+		children: [],
+		label: node.label,
+		labelTimestamp: node.labelTimestamp,
+	});
+	const roots = nodes.map(createNode);
+	const pending = nodes.map((source, index) => ({ source, target: roots[index] }));
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if (!current) break;
+		current.target.children = current.source.children.map(createNode);
+		for (let index = 0; index < current.source.children.length; index++) {
+			pending.push({ source: current.source.children[index], target: current.target.children[index] });
+		}
+	}
+	return roots;
 }
 
 interface HorizontalViewportRow {
@@ -136,7 +174,7 @@ class TreeList implements Component {
 		this.maxVisibleLines = maxVisibleLines;
 		this.filterMode = initialFilterMode ?? "default";
 		this.multipleRoots = tree.length > 1;
-		this.flatNodes = this.flattenTree(tree);
+		this.flatNodes = this.flattenTree(createDisplaySessionTree(createExternalSessionTree(tree)));
 		this.buildActivePath();
 		this.applyFilter();
 
@@ -197,7 +235,7 @@ class TreeList implements Component {
 		}
 	}
 
-	private flattenTree(roots: SessionTreeNode[]): FlatNode[] {
+	private flattenTree(roots: DisplaySessionTreeNode[]): FlatNode[] {
 		const result: FlatNode[] = [];
 		this.toolCallMap.clear();
 
@@ -207,17 +245,17 @@ class TreeList implements Component {
 		// - At indent 2+: stay flat for single-child chains, +1 only if parent branches
 
 		// Stack items: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
-		type StackItem = [SessionTreeNode, number, boolean, boolean, boolean, GutterInfo[], boolean];
+		type StackItem = [DisplaySessionTreeNode, number, boolean, boolean, boolean, GutterInfo[], boolean];
 		const stack: StackItem[] = [];
 
 		// Determine which subtrees contain the active leaf (to sort current branch first)
 		// Use iterative post-order traversal to avoid stack overflow
-		const containsActive = new Map<SessionTreeNode, boolean>();
+		const containsActive = new Map<DisplaySessionTreeNode, boolean>();
 		const leafId = this.currentLeafId;
 		{
 			// Build list in pre-order, then process in reverse for post-order effect
-			const allNodes: SessionTreeNode[] = [];
-			const preOrderStack: SessionTreeNode[] = [...roots];
+			const allNodes: DisplaySessionTreeNode[] = [];
+			const preOrderStack: DisplaySessionTreeNode[] = [...roots];
 			while (preOrderStack.length > 0) {
 				const node = preOrderStack.pop()!;
 				allNodes.push(node);
@@ -272,8 +310,8 @@ class TreeList implements Component {
 
 			// Order children so the branch containing the active leaf comes first
 			const orderedChildren = (() => {
-				const prioritized: SessionTreeNode[] = [];
-				const rest: SessionTreeNode[] = [];
+				const prioritized: DisplaySessionTreeNode[] = [];
+				const rest: DisplaySessionTreeNode[] = [];
 				for (const child of children) {
 					if (containsActive.get(child)) {
 						prioritized.push(child);
@@ -557,7 +595,7 @@ class TreeList implements Component {
 	}
 
 	/** Get searchable text content from a node */
-	private getSearchableText(node: SessionTreeNode): string {
+	private getSearchableText(node: DisplaySessionTreeNode): string {
 		const entry = node.entry;
 		const parts: string[] = [];
 
@@ -588,6 +626,7 @@ class TreeList implements Component {
 				break;
 			}
 			case "compaction":
+			case "remote_compaction":
 				parts.push("compaction");
 				break;
 			case "branch_summary":
@@ -620,7 +659,7 @@ class TreeList implements Component {
 		return this.searchQuery;
 	}
 
-	getSelectedNode(): SessionTreeNode | undefined {
+	getSelectedNode(): DisplaySessionTreeNode | undefined {
 		return this.filteredNodes[this.selectedIndex]?.node;
 	}
 
@@ -765,7 +804,7 @@ class TreeList implements Component {
 		return lines;
 	}
 
-	private getEntryDisplayText(node: SessionTreeNode, isSelected: boolean): string {
+	private getEntryDisplayText(node: DisplaySessionTreeNode, isSelected: boolean): string {
 		const entry = node.entry;
 		let result: string;
 
@@ -819,9 +858,11 @@ class TreeList implements Component {
 				result = theme.fg("customMessageLabel", `[${entry.customType}]: `) + normalize(content);
 				break;
 			}
-			case "compaction": {
+			case "compaction":
+			case "remote_compaction": {
 				const tokens = Math.round(entry.tokensBefore / 1000);
-				result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+				const label = entry.type === "remote_compaction" ? "remote compaction" : "compaction";
+				result = theme.fg("borderAccent", `[${label}: ${tokens}k tokens]`);
 				break;
 			}
 			case "branch_summary":
@@ -893,7 +934,7 @@ class TreeList implements Component {
 		return result;
 	}
 
-	private getEntryCopyText(node: SessionTreeNode): string | undefined {
+	private getEntryCopyText(node: DisplaySessionTreeNode): string | undefined {
 		const entry = node.entry;
 		let text: string | undefined;
 
@@ -912,6 +953,7 @@ class TreeList implements Component {
 				text = this.extractFullContent(entry.content);
 				break;
 			case "compaction":
+			case "remote_compaction":
 				text = entry.summary;
 				break;
 			case "branch_summary":

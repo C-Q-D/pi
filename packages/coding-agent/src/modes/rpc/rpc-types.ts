@@ -9,8 +9,11 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
-import type { CompactionResult } from "../../core/compaction/index.ts";
-import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import type {
+	ExternalSessionEntry,
+	ExternalSessionTreeNode,
+	SanitizedCompactionResult,
+} from "../../core/compaction/index.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
 // ============================================================================
@@ -168,7 +171,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_follow_up_mode"; success: true }
 
 	// Compaction
-	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult }
+	| { id?: string; type: "response"; command: "compact"; success: true; data: SanitizedCompactionResult }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
 
 	// Retry
@@ -197,14 +200,14 @@ export type RpcResponse =
 			type: "response";
 			command: "get_entries";
 			success: true;
-			data: { entries: SessionEntry[]; leafId: string | null };
+			data: { entries: ExternalSessionEntry[]; leafId: string | null };
 	  }
 	| {
 			id?: string;
 			type: "response";
 			command: "get_tree";
 			success: true;
-			data: { tree: SessionTreeNode[]; leafId: string | null };
+			data: { tree: ExternalSessionTreeNode[]; leafId: string | null };
 	  }
 	| {
 			id?: string;

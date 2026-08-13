@@ -9,8 +9,11 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
-import type { CompactionResult } from "../../core/compaction/index.ts";
-import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import type {
+	ExternalSessionEntry,
+	ExternalSessionTreeNode,
+	SanitizedCompactionResult,
+} from "../../core/compaction/index.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
 
@@ -305,7 +308,7 @@ export class RpcClient {
 	/**
 	 * Compact session context.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<SanitizedCompactionResult> {
 		const response = await this.send({ type: "compact", customInstructions });
 		return this.getData(response);
 	}
@@ -400,17 +403,17 @@ export class RpcClient {
 	/**
 	 * Get session entries in append order, optionally only those after the `since` entry id.
 	 */
-	async getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
+	async getEntries(since?: string): Promise<{ entries: ExternalSessionEntry[]; leafId: string | null }> {
 		const response = await this.send({ type: "get_entries", since });
-		return this.getData<{ entries: SessionEntry[]; leafId: string | null }>(response);
+		return this.getData<{ entries: ExternalSessionEntry[]; leafId: string | null }>(response);
 	}
 
 	/**
 	 * Get the session entry tree.
 	 */
-	async getTree(): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
+	async getTree(): Promise<{ tree: ExternalSessionTreeNode[]; leafId: string | null }> {
 		const response = await this.send({ type: "get_tree" });
-		return this.getData<{ tree: SessionTreeNode[]; leafId: string | null }>(response);
+		return this.getData<{ tree: ExternalSessionTreeNode[]; leafId: string | null }>(response);
 	}
 
 	/**

@@ -1,4 +1,5 @@
 import { Box, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { createSanitizedCompactionResult, type SanitizedCompactionResult } from "../../../core/compaction/index.ts";
 import type { CompactionSummaryMessage } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { keyText } from "./keybinding-hints.ts";
@@ -9,12 +10,12 @@ import { keyText } from "./keybinding-hints.ts";
  */
 export class CompactionSummaryMessageComponent extends Box {
 	private expanded = false;
-	private message: CompactionSummaryMessage;
+	private message: SanitizedCompactionResult;
 	private markdownTheme: MarkdownTheme;
 
 	constructor(message: CompactionSummaryMessage, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
 		super(1, 1, (t) => theme.bg("customMessageBg", t));
-		this.message = message;
+		this.message = createSanitizedCompactionResult(message);
 		this.markdownTheme = markdownTheme;
 		this.updateDisplay();
 	}

@@ -52,14 +52,22 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionMetadataErrorCode,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	createExternalSessionEntries,
+	createExternalSessionEntry,
+	createSanitizedCompactionEntry,
+	createSanitizedCompactionResult,
+	type ExternalSessionEntry,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	type SanitizedCompactionResult,
+	sanitizeCompactionError,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -97,7 +105,7 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -150,15 +158,16 @@ export type AgentSessionEvent =
 			followUp: readonly string[];
 	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
-	| { type: "entry_appended"; entry: SessionEntry }
+	| { type: "entry_appended"; entry: ExternalSessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
-			result: CompactionResult | undefined;
+			result: SanitizedCompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
+			errorCode?: CompactionMetadataErrorCode;
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
@@ -1821,7 +1830,7 @@ export class AgentSession {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					branchEntries: createExternalSessionEntries(pathEntries),
 					customInstructions,
 					reason: "manual",
 					willRetry: false,
@@ -1891,7 +1900,7 @@ export class AgentSession {
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
 					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
+					compactionEntry: createSanitizedCompactionEntry(savedCompactionEntry, { reason: "manual" }),
 					fromExtension,
 					reason: "manual",
 					willRetry: false,
@@ -1909,23 +1918,24 @@ export class AgentSession {
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
-				result: compactionResult,
+				result: createSanitizedCompactionResult(compactionResult, { reason: "manual" }),
 				aborted: false,
 				willRetry: false,
 			});
 			return compactionResult;
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			const sanitizedError = sanitizeCompactionError(error);
+			const aborted = sanitizedError.code === "cancelled" || sanitizedError.code === "aborted";
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
 				result: undefined,
 				aborted,
 				willRetry: false,
-				errorMessage: aborted ? undefined : `Compaction failed: ${message}`,
+				errorCode: sanitizedError.code,
+				errorMessage: aborted ? undefined : `Compaction failed: ${sanitizedError.message}`,
 			});
-			throw error;
+			throw sanitizedError;
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
@@ -2088,7 +2098,7 @@ export class AgentSession {
 				const extensionResult = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					branchEntries: createExternalSessionEntries(pathEntries),
 					customInstructions: undefined,
 					reason,
 					willRetry,
@@ -2172,7 +2182,7 @@ export class AgentSession {
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
 					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
+					compactionEntry: createSanitizedCompactionEntry(savedCompactionEntry, { reason }),
 					fromExtension,
 					reason,
 					willRetry,
@@ -2187,7 +2197,13 @@ export class AgentSession {
 				usage,
 				details,
 			};
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			this._emit({
+				type: "compaction_end",
+				reason,
+				result: createSanitizedCompactionResult(result, { reason }),
+				aborted: false,
+				willRetry,
+			});
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -2202,7 +2218,7 @@ export class AgentSession {
 			// Continue once so queued messages are delivered.
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			const sanitizedError = sanitizeCompactionError(error);
 			if (started) {
 				this._emit({
 					type: "compaction_end",
@@ -2210,10 +2226,11 @@ export class AgentSession {
 					result: undefined,
 					aborted: false,
 					willRetry: false,
+					errorCode: sanitizedError.code,
 					errorMessage:
 						reason === "overflow"
-							? `Context overflow recovery failed: ${errorMessage}`
-							: `Auto-compaction failed: ${errorMessage}`,
+							? `Context overflow recovery failed: ${sanitizedError.message}`
+							: `Auto-compaction failed: ${sanitizedError.message}`,
 				});
 			}
 			return false;
@@ -2386,7 +2403,7 @@ export class AgentSession {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
-						this._emit({ type: "entry_appended", entry });
+						this._emit({ type: "entry_appended", entry: createExternalSessionEntry(entry) });
 					}
 				},
 				setSessionName: (name) => {
@@ -2433,10 +2450,9 @@ export class AgentSession {
 					void (async () => {
 						try {
 							const result = await this.compact(options?.customInstructions);
-							options?.onComplete?.(result);
+							options?.onComplete?.(createSanitizedCompactionResult(result, { reason: "manual" }));
 						} catch (error) {
-							const err = error instanceof Error ? error : new Error(String(error));
-							options?.onError?.(err);
+							options?.onError?.(sanitizeCompactionError(error));
 						}
 					})();
 				},
@@ -2657,12 +2673,14 @@ export class AgentSession {
 	): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
+				const publicErrorMessage =
+					source.source === "compaction" ? sanitizeCompactionError(new Error(errorMessage)).message : errorMessage;
 				this._emit({
 					type: "summarization_retry_scheduled",
 					attempt,
 					maxAttempts,
 					delayMs,
-					errorMessage,
+					errorMessage: publicErrorMessage,
 				});
 			},
 			onRetryAttemptStart: () => {
@@ -2959,7 +2977,16 @@ export class AgentSession {
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_tree",
-					preparation,
+					preparation: {
+						targetId: preparation.targetId,
+						oldLeafId: preparation.oldLeafId,
+						commonAncestorId: preparation.commonAncestorId,
+						entriesToSummarize: createExternalSessionEntries(preparation.entriesToSummarize),
+						userWantsSummary: preparation.userWantsSummary,
+						customInstructions: preparation.customInstructions,
+						replaceInstructions: preparation.replaceInstructions,
+						label: preparation.label,
+					},
 					signal: this._branchSummaryAbortController.signal,
 				})) as SessionBeforeTreeResult | undefined;
 
