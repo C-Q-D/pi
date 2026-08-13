@@ -1,0 +1,5 @@
+{"type":"session","version":4,"id":"future-raw","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/fixture/project"}
+{"type":"message","id":"raw-before","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"raw before remote","timestamp":1}}
+this line is deliberately malformed
+{"type":"remote_compaction","id":"remote-raw","parentId":"raw-before","timestamp":"2025-01-01T00:00:02.000Z","provider":"openai","model":"gpt-test","opaquePayload":{"encrypted_content":"fixture-only"}}
+{"type":"message","id":"raw-after","parentId":"remote-raw","timestamp":"2025-01-01T00:00:03.000Z","message":{"role":"user","content":"raw after remote","timestamp":2}}

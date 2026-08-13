@@ -1,0 +1,7 @@
+{"type":"session","version":4,"id":"future-local","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/fixture/project"}
+{"type":"message","id":"discarded-before-local","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"discarded before local compaction","timestamp":1}}
+{"type":"compaction","id":"older-local","parentId":"discarded-before-local","timestamp":"2025-01-01T00:00:02.000Z","summary":"older local summary","firstKeptEntryId":"discarded-before-local","tokensBefore":20}
+{"type":"message","id":"kept-by-latest","parentId":"older-local","timestamp":"2025-01-01T00:00:03.000Z","message":{"role":"user","content":"kept by latest local compaction","timestamp":2}}
+{"type":"compaction","id":"latest-local","parentId":"kept-by-latest","timestamp":"2025-01-01T00:00:04.000Z","summary":"latest local summary","firstKeptEntryId":"kept-by-latest","tokensBefore":42}
+{"type":"remote_compaction","id":"remote-after-local","parentId":"latest-local","timestamp":"2025-01-01T00:00:05.000Z","provider":"openai","model":"gpt-test","opaquePayload":{"encrypted_content":"fixture-only"}}
+{"type":"message","id":"message-after-remote","parentId":"remote-after-local","timestamp":"2025-01-01T00:00:06.000Z","message":{"role":"user","content":"message after remote compaction","timestamp":3}}

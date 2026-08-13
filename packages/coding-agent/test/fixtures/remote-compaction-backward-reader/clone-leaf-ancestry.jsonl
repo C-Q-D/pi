@@ -1,0 +1,5 @@
+{"type":"session","version":4,"id":"future-clone","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/fixture/clone","parentSession":"/fixture/original.jsonl"}
+{"type":"message","id":"clone-root","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"clone root","timestamp":1}}
+{"type":"remote_compaction","id":"clone-remote","parentId":"clone-root","timestamp":"2025-01-01T00:00:02.000Z","provider":"openai","model":"gpt-test","opaquePayload":{"encrypted_content":"fixture-only"}}
+{"type":"message","id":"clone-sibling","parentId":"clone-remote","timestamp":"2025-01-01T00:00:03.000Z","message":{"role":"user","content":"clone sibling must stay out","timestamp":2}}
+{"type":"message","id":"clone-leaf","parentId":"clone-remote","timestamp":"2025-01-01T00:00:04.000Z","message":{"role":"user","content":"clone selected leaf","timestamp":3}}
