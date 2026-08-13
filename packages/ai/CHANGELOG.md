@@ -5,6 +5,7 @@
 ### Added
 
 - Added provider-native context binding guards for ordinary streams and compaction, with sanitized mismatch dimensions and portable authenticated request snapshots.
+- Added experimental native compaction adapters for OpenAI Responses and ChatGPT Codex Remote Compaction V2, including canonical replay, stable credential binding, bounded retries, and abort-safe result validation.
 
 ### Fixed
 

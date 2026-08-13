@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added provider-context state and continuation support so a validated opaque checkpoint can continue without synthesizing a user message.
+
 ### Changed
 
 - Changed provider-context stream dispatch to forward only defined provider options and preserve sanitized native-compaction diagnostics.

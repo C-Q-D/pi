@@ -111,6 +111,7 @@ Pi 使用 JSON 设置文件，项目设置会覆盖全局设置。
 | 设置 | 类型 | 默认值 | 说明 |
 |---------|------|---------|-------------|
 | `compaction.enabled` | boolean | `true` | 启用自动压缩 |
+| `compaction.strategy` | string | `"local"` | 压缩策略：`"local"`、`"remote"` 或 `"auto"`；Remote 与 Auto 当前为实验能力 |
 | `compaction.reserveTokens` | number | `16384` | 为 LLM 响应预留的 Token |
 | `compaction.keepRecentTokens` | number | `20000` | 保留且不进行摘要的近期 Token |
 
@@ -118,11 +119,14 @@ Pi 使用 JSON 设置文件，项目设置会覆盖全局设置。
 {
   "compaction": {
     "enabled": true,
+    "strategy": "local",
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   }
 }
 ```
+
+`local` 生成可读且可跨 Provider 使用的本地摘要；`remote` 强制使用受支持 Provider 的 Opaque Context；`auto` 先尝试 Remote，失败时最多执行一次 Local Fallback。无 Flag 的 `/compact` 使用该设置；`/compact --local` 和 `/compact --remote` 只覆盖本次操作。`/compact <自定义指令>` 为保持兼容始终使用 Local。完整行为、Binding 限制和恢复方式参阅 [compaction.md](compaction.md)。
 
 ### 分支摘要
 
@@ -280,6 +284,7 @@ Package 管理详情参阅 [packages.md](packages.md)。
   "theme": "dark",
   "compaction": {
     "enabled": true,
+    "strategy": "local",
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },

@@ -266,9 +266,6 @@ tmux kill-session -t pi-test
 <!-- codex-plan-index:start -->
 ## 当前计划索引
 
-| 计划 ID | 类型 | 文档 |
-|---|---|---|
-| SCOPE-REMOTE-COMPACTION-001 | 产品拆分 | [原生远端上下文压缩产品拆分](docs/开发计划/产品拆分-原生远端上下文压缩.md) |
-| ATOMIC-REMOTE-COMPACTION-001 | 原子开发 | [原生远端上下文压缩原子计划](docs/开发计划/原子开发计划-原生远端上下文压缩.md) |
+当前无活动计划。
 
 <!-- codex-plan-index:end -->

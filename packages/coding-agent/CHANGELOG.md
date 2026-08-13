@@ -9,6 +9,8 @@
 - Added `/compact --local` and experimental `/compact --remote` strategy selection with safe binding metadata in the interactive UI.
 - Added a persistent `local`, `remote`, or `auto` compaction strategy setting with interactive and RPC controls; the default remains Local.
 - Added threshold auto-compaction through the shared Local, Remote, and Auto transaction path, including single-flight, one-shot fallback, ordered queue continuation, and next-turn failure re-evaluation.
+- Added append-only remote compaction checkpoints with safe Resume, Fork, Clone, external metadata projection, HTML export, and portable Local recovery from the selected leaf's raw ancestry.
+- Added overflow recovery that excludes the persisted error from compaction input, retries the pending User or Tool turn exactly once, and stops a second overflow without recursive compaction.
 
 ## [0.83.0] - 2026-07-29
 
