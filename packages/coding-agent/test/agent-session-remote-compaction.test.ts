@@ -6,8 +6,10 @@ import {
 	type FauxCompactionFactory,
 	fauxAssistantMessage,
 	fauxProvider,
+	fauxToolCall,
 	type Model,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession, AgentSessionEvent, CompactOptions } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -47,7 +49,11 @@ interface Harness {
 }
 
 interface SessionWithAutoCompaction {
-	_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
+	_runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		triggerAssistantEntryId?: string,
+	): Promise<boolean>;
 }
 
 function nativeResult(label: string): FauxCompactionFactory {
@@ -59,6 +65,14 @@ function nativeResult(label: string): FauxCompactionFactory {
 			items: [{ type: "compaction", encrypted_content: `${OPAQUE_SENTINEL}:${label}` }],
 		},
 		usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+	});
+}
+
+/** 构造真实 Agent Turn 使用的 Context Overflow Assistant 结果。 */
+function overflowResponse(label: string) {
+	return fauxAssistantMessage(label, {
+		stopReason: "error",
+		errorMessage: "prompt is too long",
 	});
 }
 
@@ -309,6 +323,394 @@ describe("AgentSession manual remote compaction transaction", () => {
 				effectiveStrategy: "local",
 				fallbackCode: "provider_error",
 			},
+		});
+	});
+
+	it("excludes the raw overflow error, commits one Remote checkpoint, and retries the pending turn once", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		faux.setResponses([overflowResponse("OVERFLOW_RAW_AUDIT"), fauxAssistantMessage("retry succeeded")]);
+		faux.nativeCompaction!.setResults([nativeResult("overflow-retry")]);
+
+		await session.prompt("single overflow request");
+
+		const checkpoint = sessionManager.getEntries().find((entry) => entry.type === "remote_compaction");
+		const overflowEntry = sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					JSON.stringify(entry.message.content).includes("OVERFLOW_RAW_AUDIT"),
+			);
+		expect(overflowEntry?.type).toBe("message");
+		expect(checkpoint).toMatchObject({
+			type: "remote_compaction",
+			excludedEntryIds: overflowEntry ? [overflowEntry.id] : [],
+			metadata: { reason: "overflow", requestedStrategy: "remote", effectiveStrategy: "remote" },
+		});
+		expect(JSON.stringify(faux.nativeCompaction!.state.compactCalls[0]?.context.messages)).not.toContain(
+			"OVERFLOW_RAW_AUDIT",
+		);
+		expect(JSON.stringify(sessionManager.getEntries())).toContain("OVERFLOW_RAW_AUDIT");
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						JSON.stringify(entry.message.content).includes("single overflow request"),
+				),
+		).toHaveLength(1);
+		expect(faux.state.callCount).toBe(2);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_start")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", aborted: false, willRetry: true }),
+		]);
+		expect(session.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ text: "retry succeeded" }] });
+	});
+
+	it.each(["local", "auto"] as const)(
+		"uses configured %s overflow recovery without sending the raw error to Local summarization",
+		async (strategy) => {
+			const { session, sessionManager, faux } = await createHarness({ strategy });
+			let localPayload = "";
+			faux.setResponses([
+				overflowResponse(`OVERFLOW_${strategy.toUpperCase()}_AUDIT`),
+				(context) => {
+					localPayload = JSON.stringify(context);
+					return fauxAssistantMessage(`${strategy} local summary`);
+				},
+				fauxAssistantMessage(`${strategy} retry succeeded`),
+			]);
+			if (strategy === "auto") {
+				faux.nativeCompaction!.setResults([
+					() => {
+						throw createNativeCompactionError("provider_error");
+					},
+				]);
+			}
+
+			await session.prompt(`${strategy} overflow request`);
+
+			const checkpoint = sessionManager.getEntries().find((entry) => entry.type === "compaction");
+			expect(checkpoint).toMatchObject({
+				type: "compaction",
+				metadata: {
+					reason: "overflow",
+					requestedStrategy: strategy,
+					effectiveStrategy: "local",
+					...(strategy === "auto" ? { fallbackCode: "provider_error" } : {}),
+				},
+			});
+			expect(localPayload).not.toContain(`OVERFLOW_${strategy.toUpperCase()}_AUDIT`);
+			expect(JSON.stringify(sessionManager.getEntries())).toContain(`OVERFLOW_${strategy.toUpperCase()}_AUDIT`);
+			expect(faux.state.callCount).toBe(3);
+			expect(faux.nativeCompaction!.state.compactCallCount).toBe(strategy === "auto" ? 1 : 0);
+			expect(
+				sessionManager
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							JSON.stringify(entry.message.content).includes(`${strategy} overflow request`),
+					),
+			).toHaveLength(1);
+		},
+	);
+
+	it("stops after the only retry overflows again and emits one fixed capacity failure", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		faux.setResponses([overflowResponse("FIRST_OVERFLOW"), overflowResponse("SECOND_OVERFLOW")]);
+		faux.nativeCompaction!.setResults([nativeResult("second-overflow")]);
+
+		await session.prompt("second overflow request");
+
+		expect(faux.state.callCount).toBe(2);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_start")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", result: expect.any(Object), willRetry: true }),
+			expect.objectContaining({
+				reason: "overflow",
+				result: undefined,
+				willRetry: false,
+				errorCode: "capacity",
+				errorMessage:
+					"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+			}),
+		]);
+	});
+
+	it("settles a provider-failed overflow cycle so the next user prompt does not re-evaluate the old error", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		faux.setResponses([overflowResponse("FAILED_OVERFLOW"), fauxAssistantMessage("next prompt succeeded")]);
+		faux.nativeCompaction!.setResults([
+			() => {
+				throw createNativeCompactionError("provider_error");
+			},
+		]);
+
+		await session.prompt("provider failure trigger");
+		const terminalCount = observed.filter((event) => event.type === "compaction_end").length;
+		await session.prompt("new user turn after provider failure");
+
+		expect(terminalCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", errorCode: "provider_error", willRetry: false }),
+		]);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(faux.state.callCount).toBe(2);
+		expect(sessionManager.getEntries().some((entry) => entry.type.includes("compaction"))).toBe(false);
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ text: "next prompt succeeded" }],
+		});
+	});
+
+	it("settles an aborted overflow cycle so the next user prompt does not re-evaluate the old error", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		let release: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		faux.setResponses([overflowResponse("ABORTED_OVERFLOW"), fauxAssistantMessage("next prompt after abort")]);
+		faux.nativeCompaction!.setResults([
+			async (request) => {
+				markStarted?.();
+				await gate;
+				return nativeResult("aborted-overflow")(request, faux.nativeCompaction!.state);
+			},
+		]);
+
+		const pending = session.prompt("abort overflow trigger");
+		await started;
+		session.abortCompaction();
+		release?.();
+		await pending;
+		const terminalCount = observed.filter((event) => event.type === "compaction_end").length;
+		await session.prompt("new user turn after abort");
+
+		expect(terminalCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", aborted: true, willRetry: false }),
+		]);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(faux.state.callCount).toBe(2);
+		expect(sessionManager.getEntries().some((entry) => entry.type.includes("compaction"))).toBe(false);
+	});
+
+	it("settles a stale-branch overflow cycle so the next user prompt does not re-evaluate the old error", async () => {
+		const managerRef: { current?: SessionManager } = {};
+		let mutated = false;
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("session_before_compact", () => {
+				if (mutated) return;
+				mutated = true;
+				managerRef.current?.appendMessage({ role: "user", content: "branch changed", timestamp: 3 });
+			});
+		};
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote", extension });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		managerRef.current = sessionManager;
+		faux.setResponses([overflowResponse("STALE_OVERFLOW"), fauxAssistantMessage("next prompt after stale")]);
+		faux.nativeCompaction!.setResults([nativeResult("must-not-dispatch")]);
+
+		await session.prompt("stale overflow trigger");
+		const terminalCount = observed.filter((event) => event.type === "compaction_end").length;
+		await session.prompt("new user turn after stale branch");
+
+		expect(terminalCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", errorCode: "stale_branch", willRetry: false }),
+		]);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(0);
+		expect(faux.state.callCount).toBe(2);
+		expect(sessionManager.getEntries().some((entry) => entry.type.includes("compaction"))).toBe(false);
+	});
+
+	it("retries the overflow turn once before draining a queued follow-up in the same continuation", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		let release: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		faux.setResponses([
+			overflowResponse("QUEUED_OVERFLOW"),
+			fauxAssistantMessage("overflow retry succeeded"),
+			fauxAssistantMessage("queued follow-up succeeded"),
+		]);
+		faux.nativeCompaction!.setResults([
+			async (request) => {
+				markStarted?.();
+				await gate;
+				return nativeResult("queued-overflow")(request, faux.nativeCompaction!.state);
+			},
+		]);
+		const continueSpy = vi.spyOn(session.agent, "continue");
+
+		const pending = session.prompt("overflow turn with queue");
+		await started;
+		await session.followUp("queued follow-up");
+		release?.();
+		await pending;
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(faux.state.callCount).toBe(3);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", result: expect.any(Object), willRetry: true }),
+		]);
+		for (const text of ["overflow turn with queue", "queued follow-up"]) {
+			expect(
+				sessionManager
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							JSON.stringify(entry.message.content).includes(text),
+					),
+			).toHaveLength(1);
+		}
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ text: "queued follow-up succeeded" }],
+		});
+	});
+
+	it("treats a queued follow-up overflow as a new recovery cycle after the original retry settles", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		let release: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		faux.setResponses([
+			overflowResponse("ORIGINAL_OVERFLOW"),
+			fauxAssistantMessage("original retry succeeded"),
+			overflowResponse("FOLLOW_UP_OVERFLOW"),
+			fauxAssistantMessage("follow-up retry succeeded"),
+		]);
+		faux.nativeCompaction!.setResults([
+			async (request) => {
+				markStarted?.();
+				await gate;
+				return nativeResult("original-cycle")(request, faux.nativeCompaction!.state);
+			},
+			nativeResult("follow-up-cycle"),
+		]);
+
+		const pending = session.prompt("original overflow turn");
+		await started;
+		await session.followUp("queued overflow follow-up");
+		release?.();
+		await pending;
+
+		expect(faux.state.callCount).toBe(4);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(2);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(2);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", result: expect.any(Object), willRetry: true }),
+			expect.objectContaining({ reason: "overflow", result: expect.any(Object), willRetry: true }),
+		]);
+		for (const text of ["original overflow turn", "queued overflow follow-up"]) {
+			expect(
+				sessionManager
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							JSON.stringify(entry.message.content).includes(text),
+					),
+			).toHaveLength(1);
+		}
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ text: "follow-up retry succeeded" }],
+		});
+	});
+
+	it("retries once when the pending overflow turn is a persisted tool result", async () => {
+		let toolRuns = 0;
+		const extension: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "overflow_pending_tool",
+				label: "Overflow pending tool",
+				description: "Creates one persisted tool result before overflow recovery",
+				parameters: Type.Object({}),
+				execute: async () => {
+					toolRuns++;
+					return { content: [{ type: "text", text: "persisted tool result" }], details: {} };
+				},
+			});
+		};
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote", extension });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("overflow_pending_tool", {}), { stopReason: "toolUse" }),
+			overflowResponse("TOOL_RESULT_OVERFLOW"),
+			fauxAssistantMessage("tool-result retry succeeded"),
+		]);
+		faux.nativeCompaction!.setResults([nativeResult("tool-result-overflow")]);
+
+		await session.prompt("tool-result pending overflow");
+
+		expect(toolRuns).toBe(1);
+		expect(faux.state.callCount).toBe(3);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "overflow", result: expect.any(Object), willRetry: true }),
+		]);
+		expect(JSON.stringify(faux.nativeCompaction!.state.compactCalls[0]?.context.messages)).toContain(
+			"persisted tool result",
+		);
+		expect(JSON.stringify(faux.nativeCompaction!.state.compactCalls[0]?.context.messages)).not.toContain(
+			"TOOL_RESULT_OVERFLOW",
+		);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						JSON.stringify(entry.message.content).includes("tool-result pending overflow"),
+				),
+		).toHaveLength(1);
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ text: "tool-result retry succeeded" }],
 		});
 	});
 
@@ -776,6 +1178,34 @@ describe("AgentSession manual remote compaction transaction", () => {
 			1,
 		);
 		expect(committed.sessionManager.buildSessionContext().providerContext).toBeDefined();
+	});
+
+	it("reports a committed Overflow rebuild failure without retrying", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		faux.setResponses([overflowResponse("COMMITTED_REBUILD_OVERFLOW")]);
+		faux.nativeCompaction!.setResults([nativeResult("committed-overflow-rebuild")]);
+		session.agent.replaceContext = () => {
+			throw new Error("synthetic replacement failure");
+		};
+		const continueSpy = vi.spyOn(session.agent, "continue");
+
+		await session.prompt("overflow rebuild failure");
+
+		expect(faux.state.callCount).toBe(1);
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({
+				reason: "overflow",
+				errorCode: "committed_restart_required",
+				errorMessage:
+					"Context overflow recovery failed: Compaction was committed, but the active context could not be rebuilt. Restart required.",
+				willRetry: false,
+			}),
+		]);
 	});
 
 	it("keeps the object options type independently usable by SDK callers", () => {

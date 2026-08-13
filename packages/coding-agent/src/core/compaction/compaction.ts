@@ -428,12 +428,16 @@ export function findCutPoint(
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
 			// Find the closest valid cut point at or after this entry
+			let foundCutPoint = false;
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
+					foundCutPoint = true;
 					break;
 				}
 			}
+			// 会话末尾是 Tool Result 时，必须从其对应的 Assistant Tool Call 开始保留。
+			if (!foundCutPoint) cutIndex = cutPoints[cutPoints.length - 1];
 			break;
 		}
 	}

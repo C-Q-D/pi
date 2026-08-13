@@ -79,7 +79,7 @@ function createLocalMetadata(operationId: string, tokensBefore = 120) {
 	});
 }
 
-function assistantMessage(text: string): Message {
+function assistantMessage(text: string, stopReason: "stop" | "error" = "stop"): Message {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -94,7 +94,8 @@ function assistantMessage(text: string): Message {
 			totalTokens: 2,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "stop",
+		stopReason,
+		...(stopReason === "error" ? { errorMessage: "prompt is too long" } : {}),
 		timestamp: 2,
 	};
 }
@@ -122,6 +123,80 @@ function appendRemote(
 		providerContext,
 		metadata: createRemoteMetadata(operationId, providerContext),
 	});
+}
+
+/** 构造可用于 JSONL Resume 的 Local 或 Remote Overflow 排除图。 */
+function createExclusionFixtureEntries(
+	directory: string,
+	checkpointType: "local" | "remote",
+	excludedEntryId: string,
+): object[] {
+	const providerContext = createProviderContext("EXCLUSION_AUDIT_SENTINEL");
+	const checkpoint =
+		checkpointType === "local"
+			? {
+					type: "compaction",
+					id: "checkpoint",
+					parentId: "trigger-assistant",
+					timestamp: "2026-08-13T00:00:04.000Z",
+					operationId: "operation-exclusion",
+					summary: "local summary",
+					firstKeptEntryId: "root-user",
+					tokensBefore: 120,
+					metadata: createLocalMetadata("operation-exclusion"),
+					excludedEntryIds: [excludedEntryId],
+				}
+			: {
+					type: "remote_compaction",
+					id: "checkpoint",
+					parentId: "trigger-assistant",
+					timestamp: "2026-08-13T00:00:04.000Z",
+					operationId: "operation-exclusion",
+					summary: "remote checkpoint",
+					firstKeptEntryId: "checkpoint",
+					tokensBefore: 120,
+					providerContext,
+					metadata: createRemoteMetadata("operation-exclusion", providerContext),
+					excludedEntryIds: [excludedEntryId],
+				};
+	return [
+		{
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: `${checkpointType}-exclusion-session`,
+			timestamp: "2026-08-13T00:00:00.000Z",
+			cwd: directory,
+		},
+		{
+			type: "message",
+			id: "root-user",
+			parentId: null,
+			timestamp: "2026-08-13T00:00:01.000Z",
+			message: { role: "user", content: "audit user", timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "trigger-assistant",
+			parentId: "root-user",
+			timestamp: "2026-08-13T00:00:02.000Z",
+			message: assistantMessage("overflow audit trigger", "error"),
+		},
+		{
+			type: "message",
+			id: "sibling-assistant",
+			parentId: "root-user",
+			timestamp: "2026-08-13T00:00:03.000Z",
+			message: assistantMessage("sibling overflow", "error"),
+		},
+		checkpoint,
+		{
+			type: "message",
+			id: "descendant-user",
+			parentId: "checkpoint",
+			timestamp: "2026-08-13T00:00:05.000Z",
+			message: { role: "user", content: "audit descendant", timestamp: 5 },
+		},
+	];
 }
 
 describe("remote compaction session v4", () => {
@@ -276,7 +351,7 @@ describe("remote compaction session v4", () => {
 		const customDetails = { nested: { value: "original" } };
 		const customId = session.appendCustomMessageEntry("portable-note", "custom message", false, customDetails);
 		const branchSummaryId = session.branchWithSummary(customId, "branch facts", { source: "abandoned" });
-		const excludedId = session.appendMessage(assistantMessage("overflow trigger result"));
+		const excludedId = session.appendMessage(assistantMessage("overflow trigger result", "error"));
 		const keptId = session.appendMessage({ role: "user", content: "kept tail", timestamp: 5 });
 
 		const portable = session.buildPortableRawEntries(new Set([excludedId]));
@@ -505,6 +580,46 @@ describe("remote compaction session v4", () => {
 		session.branch("invalid-sibling");
 		expect(() => session.buildSessionContext()).toThrowError(SessionContextError);
 	});
+
+	it.each([
+		{ checkpointType: "local" as const, target: "root-user", caseName: "user entry" },
+		{ checkpointType: "local" as const, target: "sibling-assistant", caseName: "sibling entry" },
+		{ checkpointType: "local" as const, target: "descendant-user", caseName: "descendant entry" },
+		{ checkpointType: "local" as const, target: "unknown-entry", caseName: "unknown entry" },
+		{ checkpointType: "remote" as const, target: "root-user", caseName: "user entry" },
+		{ checkpointType: "remote" as const, target: "sibling-assistant", caseName: "sibling entry" },
+		{ checkpointType: "remote" as const, target: "descendant-user", caseName: "descendant entry" },
+		{ checkpointType: "remote" as const, target: "unknown-entry", caseName: "unknown entry" },
+	])("rejects a corrupted $checkpointType exclusion targeting a $caseName", ({ checkpointType, target }) => {
+		const directory = createTempDirectory(`pi-${checkpointType}-exclusion-corruption-`);
+		const sessionFile = join(directory, "corrupted-exclusion.jsonl");
+		const entries = createExclusionFixtureEntries(directory, checkpointType, target);
+		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+		const session = SessionManager.open(sessionFile, directory, directory);
+		expect(() => session.buildSessionContext()).toThrowError(SessionContextError);
+		expect(() => session.buildPortableRawEntries()).toThrowError(SessionContextError);
+		const rawFile = readFileSync(sessionFile, "utf8");
+		expect(rawFile).toContain("audit user");
+		expect(rawFile).toContain("overflow audit trigger");
+		expect(rawFile).toContain("audit descendant");
+	});
+
+	it.each(["local", "remote"] as const)(
+		"resumes a valid %s overflow exclusion while preserving the raw error record",
+		(checkpointType) => {
+			const directory = createTempDirectory(`pi-${checkpointType}-valid-exclusion-`);
+			const sessionFile = join(directory, "valid-exclusion.jsonl");
+			const entries = createExclusionFixtureEntries(directory, checkpointType, "trigger-assistant");
+			writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+			const session = SessionManager.open(sessionFile, directory, directory);
+			const context = session.buildSessionContext();
+			expect(JSON.stringify(context.messages)).not.toContain("overflow audit trigger");
+			expect(session.buildPortableRawEntries().map((entry) => entry.id)).toEqual(["root-user", "descendant-user"]);
+			expect(readFileSync(sessionFile, "utf8")).toContain("overflow audit trigger");
+		},
+	);
 
 	it.each([
 		{

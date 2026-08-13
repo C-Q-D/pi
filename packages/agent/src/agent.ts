@@ -472,6 +472,12 @@ export class Agent {
 		const messages = this._state.messages;
 		const lastMessage = messages[messages.length - 1];
 		if (!lastMessage) {
+			// Native Remote checkpoint 可以只保留 Opaque Provider Context；
+			// 它本身就是下一次 continuation 的完整输入，不需要合成 User Message。
+			if (this._state.providerContext !== undefined) {
+				await this.runContinuation();
+				return;
+			}
 			throw new Error("No messages to continue from");
 		}
 

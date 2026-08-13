@@ -318,6 +318,14 @@ interface ActiveCompactionAttempt {
 	committed: boolean;
 }
 
+/** 一次 Overflow 的压缩与唯一 Retry 生命周期。 */
+interface OverflowRecoveryCycle {
+	/** 被保留在 Raw Audit、但必须从压缩输入排除的精确 Assistant Entry ID。 */
+	readonly triggerAssistantEntryId: string;
+	/** Cycle 当前阶段；settled 会一直保护旧 Trigger，直到下一条 User Message 开始。 */
+	phase: "compacting" | "retry_running" | "settled";
+}
+
 interface LocalGeneratedCompaction {
 	readonly effectiveStrategy: "local";
 	readonly result: CompactionResult;
@@ -408,10 +416,16 @@ export class AgentSession {
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
-	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _activeCompactionAttempt: ActiveCompactionAttempt | undefined = undefined;
 	private readonly _thresholdCompactionEvaluatedMessages = new WeakSet<AssistantMessage>();
-	private _overflowRecoveryAttempted = false;
+	/** 将当前进程产生的 Assistant Message 精确绑定到已持久化 Entry。 */
+	private readonly _assistantEntryIds = new WeakMap<AssistantMessage, string>();
+	/** 防止同一个 Overflow Message 在 post-run 与 pre-prompt 被重复求值。 */
+	private readonly _overflowCompactionEvaluatedMessages = new WeakSet<AssistantMessage>();
+	/** 当前 Overflow 恢复 Cycle；只允许一次压缩与一次 Retry。 */
+	private _overflowRecoveryCycle: OverflowRecoveryCycle | undefined = undefined;
+	/** Retry continuation 中第一个不再继续 Tool Loop 的 Assistant 结果。 */
+	private _overflowRetryResult: AssistantMessage | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -687,7 +701,14 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
+			if (this._overflowRecoveryCycle?.phase === "retry_running" && this._overflowRetryResult) {
+				// Retry 已经结束；当前 User 是独立的新 Turn，必须先结算旧 Cycle。
+				this._finishOverflowRecoveryRetry(this._overflowRetryResult);
+			}
+			if (this._overflowRecoveryCycle?.phase === "settled") {
+				this._overflowRecoveryCycle = undefined;
+				this._overflowRetryResult = undefined;
+			}
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -705,6 +726,17 @@ export class AgentSession {
 				}
 			}
 		}
+		if (
+			event.type === "turn_end" &&
+			this._overflowRecoveryCycle?.phase === "retry_running" &&
+			this._overflowRetryResult === undefined &&
+			event.message.role === "assistant" &&
+			event.toolResults.length === 0
+		) {
+			// 同一次 Agent continuation 可能继续消费 Follow-up；只锁定 Pending Turn
+			// 自己的第一个终止结果，避免用后续队列回答判断第二次 Overflow。
+			this._overflowRetryResult = event.message;
+		}
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
@@ -714,6 +746,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			let persistedMessageEntryId: string | undefined;
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -729,22 +762,18 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				persistedMessageEntryId = this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
-
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-				}
+				if (persistedMessageEntryId) this._assistantEntryIds.set(event.message, persistedMessageEntryId);
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				if (event.message.stopReason !== "error" && this._retryAttempt > 0) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
@@ -1041,11 +1070,7 @@ export class AgentSession {
 
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
-		return (
-			this._autoCompactionAbortController !== undefined ||
-			this._compactionAbortController !== undefined ||
-			this._branchSummaryAbortController !== undefined
-		);
+		return this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -1176,6 +1201,9 @@ export class AgentSession {
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
 			return false;
+		}
+		if (this._overflowRecoveryCycle?.phase === "retry_running") {
+			return this._finishOverflowRecoveryRetry(this._overflowRetryResult ?? msg);
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
@@ -1962,11 +1990,18 @@ export class AgentSession {
 				reason: options.reason,
 				result: undefined,
 				aborted,
-				willRetry: attempt.committed ? options.willRetry : false,
+				// 只有成功完成 Rebuild 的 Overflow 才会进入 Retry；任意失败都不会 Retry。
+				willRetry: false,
 				errorCode: sanitizedError.code,
 				errorMessage: aborted
 					? undefined
-					: `${options.reason === "threshold" ? "Auto-compaction" : "Compaction"} failed: ${sanitizedError.message}`,
+					: `${
+							options.reason === "threshold"
+								? "Auto-compaction"
+								: options.reason === "overflow"
+									? "Context overflow recovery"
+									: "Compaction"
+						} failed: ${sanitizedError.message}`,
 			});
 			throw sanitizedError;
 		} finally {
@@ -2019,7 +2054,7 @@ export class AgentSession {
 			generated = await this._generateLocalCompaction(model, preparation, options, attempt);
 		} else {
 			try {
-				generated = await this._generateRemoteCompaction(model, attempt);
+				generated = await this._generateRemoteCompaction(model, attempt, options.excludedEntryIds);
 			} catch (error) {
 				const nativeError = sanitizeCompactionError(error);
 				if (
@@ -2042,7 +2077,7 @@ export class AgentSession {
 		this._throwIfCompactionAborted();
 		this._assertCompactionBranchUnchanged(attempt);
 		const metadata = this._createAttemptMetadata(attempt, options, model, generated);
-		const committedEntry = this._appendCompactionAttempt(attempt, generated, metadata);
+		const committedEntry = this._appendCompactionAttempt(attempt, generated, metadata, options.excludedEntryIds);
 		attempt.committed = true;
 		attempt.phase = "committed";
 
@@ -2153,12 +2188,13 @@ export class AgentSession {
 	private async _generateRemoteCompaction(
 		model: Model<any>,
 		attempt: ActiveCompactionAttempt,
+		excludedEntryIds: ReadonlySet<string>,
 	): Promise<RemoteGeneratedCompaction> {
 		this._activeCompactionAttempt!.phase = "native";
 		if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") {
 			throw createNativeCompactionError("unsupported");
 		}
-		const sessionContext = this.sessionManager.buildSessionContext();
+		const sessionContext = this.sessionManager.buildSessionContext(excludedEntryIds);
 		const messages = await this.agent.convertToLlm(structuredClone(sessionContext.messages));
 		this._throwIfCompactionAborted();
 		this._assertCompactionBranchUnchanged(attempt);
@@ -2190,7 +2226,7 @@ export class AgentSession {
 			generated.effectiveStrategy === "local" ? generated.result.tokensBefore : generated.tokensBefore;
 		const estimatedTokensAfter =
 			generated.effectiveStrategy === "local"
-				? this._estimateLocalCompactionTokensAfter(attempt, generated)
+				? this._estimateLocalCompactionTokensAfter(attempt, generated, options.excludedEntryIds)
 				: undefined;
 		const usage = generated.result.usage;
 		const binding = generated.effectiveStrategy === "remote" ? generated.result.providerContext.binding : undefined;
@@ -2214,6 +2250,7 @@ export class AgentSession {
 	private _estimateLocalCompactionTokensAfter(
 		attempt: ActiveCompactionAttempt,
 		generated: LocalGeneratedCompaction,
+		excludedEntryIds: ReadonlySet<string>,
 	): number {
 		const previewEntry: CompactionEntry = {
 			type: "compaction",
@@ -2227,6 +2264,7 @@ export class AgentSession {
 			details: generated.result.details,
 			usage: generated.result.usage,
 			fromHook: generated.fromExtension,
+			...(excludedEntryIds.size === 0 ? {} : { excludedEntryIds: [...excludedEntryIds] }),
 		};
 		const preview = buildSessionContext([...this.sessionManager.getEntries(), previewEntry], previewEntry.id);
 		return estimateMessagesTokens(preview.messages);
@@ -2237,9 +2275,12 @@ export class AgentSession {
 		attempt: ActiveCompactionAttempt,
 		generated: GeneratedCompaction,
 		metadata: CompactionMetadata,
+		excludedEntryIdsInput: ReadonlySet<string>,
 	): CompactionEntry | RemoteCompactionEntry {
 		attempt.phase = "append";
 		try {
+			const excludedEntryIds =
+				excludedEntryIdsInput.size === 0 ? undefined : Object.freeze([...excludedEntryIdsInput]);
 			if (generated.effectiveStrategy === "remote") {
 				return this.sessionManager.appendRemoteCompaction({
 					entryId: attempt.entryId,
@@ -2250,6 +2291,7 @@ export class AgentSession {
 					usage: generated.result.usage,
 					providerContext: generated.result.providerContext,
 					metadata,
+					...(excludedEntryIds === undefined ? {} : { excludedEntryIds }),
 				});
 			}
 			return this.sessionManager.appendCompactionTransaction({
@@ -2263,6 +2305,7 @@ export class AgentSession {
 				usage: generated.result.usage,
 				fromHook: generated.fromExtension,
 				metadata,
+				...(excludedEntryIds === undefined ? {} : { excludedEntryIds }),
 			});
 		} catch {
 			const committed = this._reloadAndFindCompaction(attempt.operationId);
@@ -2320,7 +2363,6 @@ export class AgentSession {
 	 */
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
-		this._autoCompactionAbortController?.abort();
 	}
 
 	/**
@@ -2328,6 +2370,41 @@ export class AgentSession {
 	 */
 	abortBranchSummary(): void {
 		this._branchSummaryAbortController?.abort();
+	}
+
+	/**
+	 * 只接受当前运行中由 message_end 精确登记的 Assistant Entry。
+	 * 恢复出来的同形消息不能按时间戳或文本猜测身份，否则可能排除错误的审计记录。
+	 */
+	private _findOverflowTriggerEntryId(assistantMessage: AssistantMessage): string | undefined {
+		const entryId = this._assistantEntryIds.get(assistantMessage);
+		if (!entryId) return undefined;
+		const entry = this.sessionManager.getBranch().find((candidate) => candidate.id === entryId);
+		if (entry?.type !== "message" || entry.message !== assistantMessage || entry.message.role !== "assistant") {
+			return undefined;
+		}
+		return entryId;
+	}
+
+	/** 完成唯一一次 Overflow Retry，并在第二次溢出时发出固定 Capacity 失败。 */
+	private _finishOverflowRecoveryRetry(assistantMessage: AssistantMessage): boolean {
+		const cycle = this._overflowRecoveryCycle;
+		if (!cycle) return false;
+		cycle.phase = "settled";
+		this._overflowRetryResult = undefined;
+		if (isContextOverflow(assistantMessage, this.model?.contextWindow ?? 0)) {
+			this._emit({
+				type: "compaction_end",
+				reason: "overflow",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorCode: "capacity",
+				errorMessage:
+					"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+			});
+		}
+		return this.agent.hasQueuedMessages();
 	}
 
 	/**
@@ -2344,6 +2421,9 @@ export class AgentSession {
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
+		// 已结束的 Overflow Cycle 必须等到下一条 User Message 真正开始后再清理；
+		// pre-prompt 对同一个旧 Error 的检查不能生成第二条失败事件。
+		if (this._overflowRecoveryCycle?.phase === "settled") return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
@@ -2378,27 +2458,27 @@ export class AgentSession {
 				return await this._runAutoCompaction("overflow", false);
 			}
 
-			if (this._overflowRecoveryAttempted) {
+			if (this._overflowCompactionEvaluatedMessages.has(assistantMessage)) return false;
+			this._overflowCompactionEvaluatedMessages.add(assistantMessage);
+			const triggerAssistantEntryId = this._findOverflowTriggerEntryId(assistantMessage);
+			if (!triggerAssistantEntryId) {
 				this._emit({
 					type: "compaction_end",
 					reason: "overflow",
 					result: undefined,
 					aborted: false,
 					willRetry: false,
-					errorMessage:
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+					errorCode: "invalid_context",
+					errorMessage: "Context overflow recovery failed: Compaction input is invalid.",
 				});
 				return false;
 			}
 
-			this._overflowRecoveryAttempted = true;
-			// Remove the error message from agent state (it IS saved to session for history,
-			// but we don't want it in context for the retry)
-			const messages = this.agent.state.messages;
-			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.state.messages = messages.slice(0, -1);
-			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			this._overflowRecoveryCycle = {
+				triggerAssistantEntryId,
+				phase: "compacting",
+			};
+			return await this._runAutoCompaction("overflow", true, triggerAssistantEntryId);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2440,200 +2520,37 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
-		if (reason === "threshold") {
-			try {
-				await this._runCompactionAttempt({
-					reason,
-					requestedStrategy: this.compactionStrategy,
-					excludedEntryIds: new Set(),
-					willRetry: false,
-				});
-				// _handlePostAgentRun owns the continuation. Returning true only when
-				// Agent-level work is waiting preserves its existing queue order.
-				return this.agent.hasQueuedMessages();
-			} catch {
-				// The shared FSM already emitted the single sanitized terminal event.
-				// A later complete turn may evaluate the threshold again.
-				return false;
-			}
-		}
-
-		const settings = this.settingsManager.getCompactionSettings();
-		let started = false;
-
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		triggerAssistantEntryId?: string,
+	): Promise<boolean> {
+		const excludedEntryIds =
+			triggerAssistantEntryId === undefined ? new Set<string>() : new Set([triggerAssistantEntryId]);
 		try {
-			if (!this.model) {
-				return false;
-			}
-
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFunction === streamSimple) {
-				({ apiKey, headers, env } = await this._getRequiredRequestAuth(this.model));
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
-			}
-
-			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
-
-			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
-			started = true;
-
-			let extensionCompaction: CompactionResult | undefined;
-			let fromExtension = false;
-
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const extensionResult = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: createExternalSessionEntries(pathEntries),
-					customInstructions: undefined,
-					reason,
-					requestedStrategy: "local",
-					willRetry,
-					signal: this._autoCompactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
-
-				if (extensionResult?.cancel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: true,
-						willRetry: false,
-					});
-					return false;
-				}
-
-				if (extensionResult?.compaction) {
-					extensionCompaction = extensionResult.compaction;
-					fromExtension = true;
-				}
-			}
-
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let usage: Usage | undefined;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				// Generate compaction result
-				const compactResult = await compact(
-					preparation,
-					this.model,
-					apiKey,
-					headers,
-					undefined,
-					this._autoCompactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
-					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason }),
-				);
-				summary = compactResult.summary;
-				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
-				usage = compactResult.usage;
-				details = compactResult.details;
-			}
-
-			if (this._autoCompactionAbortController.signal.aborted) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: true,
-					willRetry: false,
-				});
-				return false;
-			}
-
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
-
-			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
-
-			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: createSanitizedCompactionEntry(savedCompactionEntry, { reason }),
-					fromExtension,
-					reason,
-					requestedStrategy: "local",
-					willRetry,
-				});
-			}
-
-			const result: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				usage,
-				details,
-			};
-			this._emit({
-				type: "compaction_end",
+			await this._runCompactionAttempt({
 				reason,
-				result: createSanitizedCompactionResult(result, { reason }),
-				aborted: false,
+				requestedStrategy: this.compactionStrategy,
+				excludedEntryIds,
 				willRetry,
 			});
-
-			if (willRetry) {
-				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.state.messages = messages.slice(0, -1);
-				}
+			if (reason === "overflow" && willRetry) {
+				const cycle = this._overflowRecoveryCycle;
+				if (!cycle || cycle.triggerAssistantEntryId !== triggerAssistantEntryId) return false;
+				this._overflowRetryResult = undefined;
+				cycle.phase = "retry_running";
 				return true;
 			}
-
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
+			// _handlePostAgentRun owns the continuation. Returning true only when
+			// Agent-level work is waiting preserves its existing queue order.
 			return this.agent.hasQueuedMessages();
-		} catch (error) {
-			const sanitizedError = sanitizeCompactionError(error);
-			if (started) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorCode: sanitizedError.code,
-					errorMessage:
-						reason === "overflow"
-							? `Context overflow recovery failed: ${sanitizedError.message}`
-							: `Auto-compaction failed: ${sanitizedError.message}`,
-				});
+		} catch {
+			const cycle = this._overflowRecoveryCycle;
+			if (reason === "overflow" && cycle && cycle.triggerAssistantEntryId === triggerAssistantEntryId) {
+				cycle.phase = "settled";
 			}
+			// 共享 FSM 已经发出唯一、已净化的终止事件。
 			return false;
-		} finally {
-			this._autoCompactionAbortController = undefined;
 		}
 	}
 

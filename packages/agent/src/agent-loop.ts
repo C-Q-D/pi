@@ -207,11 +207,12 @@ export function agentLoopContinue(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	if (context.messages.length === 0) {
+	// Opaque Provider Context 是 Native Remote checkpoint 的完整 continuation 输入。
+	if (context.messages.length === 0 && context.providerContext === undefined) {
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant") {
+	if (context.messages[context.messages.length - 1]?.role === "assistant") {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -274,11 +275,12 @@ export async function runAgentLoopContinue(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	if (context.messages.length === 0) {
+	// Opaque Provider Context 是 Native Remote checkpoint 的完整 continuation 输入。
+	if (context.messages.length === 0 && context.providerContext === undefined) {
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant") {
+	if (context.messages[context.messages.length - 1]?.role === "assistant") {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 

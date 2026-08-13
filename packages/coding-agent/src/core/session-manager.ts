@@ -100,6 +100,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 	/** 安全事务 Metadata；旧 Local Checkpoint 不包含。 */
 	metadata?: CompactionMetadata;
+	/** 仍保留在 Raw Audit、但不得重新进入上下文的 Overflow Assistant Entry。 */
+	excludedEntryIds?: readonly string[];
 }
 
 /** 创建一个在 Commit Point 前固定 Identity 的幂等 Local Checkpoint。 */
@@ -114,6 +116,7 @@ export interface AppendCompactionOptions<T = unknown> {
 	usage?: Usage;
 	fromHook?: boolean;
 	metadata: CompactionMetadata;
+	excludedEntryIds?: readonly string[];
 }
 
 /** Provider 原生压缩产生的持久化检查点。原始 Provider Context 只能在内部 Session 流程中使用。 */
@@ -128,6 +131,8 @@ export interface RemoteCompactionEntry extends SessionEntryBase {
 	usage?: NativeCompactionUsage;
 	providerContext: ProviderContextEnvelope;
 	metadata: CompactionMetadata;
+	/** 仍保留在 Raw Audit、但不得重新进入上下文的 Overflow Assistant Entry。 */
+	excludedEntryIds?: readonly string[];
 }
 
 /** 已识别为当前格式、但 Provider Context 已损坏的安全内存标记。 */
@@ -142,6 +147,9 @@ export interface InvalidRemoteCompactionEntry extends SessionEntryBase {
 	errorCode: "invalid_context";
 	/** 原记录缺少可索引 ID 时为 true；该安全标记不会保存 Provider Payload。 */
 	invalidIdentity?: true;
+	/** Checkpoint 的排除清单自身损坏；Portable 路径也必须 Fail-closed。 */
+	invalidExclusions?: true;
+	excludedEntryIds?: readonly string[];
 }
 
 /** 创建 Remote Entry 时必须由 Attempt 预先生成的稳定身份与完整结果。 */
@@ -155,6 +163,7 @@ export interface AppendRemoteCompactionOptions {
 	usage?: NativeCompactionUsage;
 	providerContext: ProviderContextEnvelope;
 	metadata: CompactionMetadata;
+	excludedEntryIds?: readonly string[];
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -447,6 +456,25 @@ function readNonNegativeNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/** 不触发 Accessor，读取一个闭合且无重复项的排除清单。 */
+function readCompactionExcludedEntryIds(value: unknown): readonly string[] | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const descriptor = Object.getOwnPropertyDescriptor(value, "excludedEntryIds");
+	if (!descriptor) return undefined;
+	if (!descriptor.enumerable || !("value" in descriptor) || !Array.isArray(descriptor.value)) {
+		throw new SessionContextError();
+	}
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	for (const candidate of descriptor.value) {
+		const id = readNonEmptyString(candidate);
+		if (!id || seen.has(id)) throw new SessionContextError();
+		seen.add(id);
+		ids.push(id);
+	}
+	return Object.freeze(ids);
+}
+
 function createRemoteCompactionMetadata(
 	value: unknown,
 	operationId: string,
@@ -508,6 +536,12 @@ function createInvalidRemoteCompactionEntry(
 		errorCode: "invalid_context",
 	};
 	if (invalidIdentity) entry.invalidIdentity = true;
+	try {
+		const excludedEntryIds = readCompactionExcludedEntryIds(value);
+		if (excludedEntryIds !== undefined) entry.excludedEntryIds = excludedEntryIds;
+	} catch {
+		entry.invalidExclusions = true;
+	}
 	return Object.freeze(entry);
 }
 
@@ -562,6 +596,7 @@ function normalizeParsedSessionEntry(value: unknown): FileEntry {
 		}
 
 		const usageValue = readOwnDataProperty(value, "usage");
+		const excludedEntryIds = readCompactionExcludedEntryIds(value);
 		const validatedResult = validateNativeCompactionResult(
 			usageValue === undefined
 				? { providerContext: readOwnDataProperty(value, "providerContext") }
@@ -588,6 +623,7 @@ function normalizeParsedSessionEntry(value: unknown): FileEntry {
 		};
 		if (estimatedTokensAfter !== undefined) entry.estimatedTokensAfter = estimatedTokensAfter;
 		if (validatedResult.usage !== undefined) entry.usage = validatedResult.usage;
+		if (excludedEntryIds !== undefined) entry.excludedEntryIds = excludedEntryIds;
 		return Object.freeze(entry);
 	} catch {
 		return createInvalidRemoteCompactionEntry(value, id);
@@ -669,6 +705,52 @@ function buildSessionPath(
 	return path;
 }
 
+function validateCompactionExclusions(
+	path: readonly SessionEntry[],
+	boundaryIndex: number,
+	excludedEntryIds: Iterable<unknown>,
+	collected: Set<string>,
+): void {
+	for (const candidate of excludedEntryIds) {
+		const id = readNonEmptyString(candidate);
+		if (!id) throw new SessionContextError();
+		const entryIndex = path.findIndex((entry) => entry.id === id);
+		const entry = entryIndex >= 0 ? path[entryIndex] : undefined;
+		if (
+			!entry ||
+			entryIndex >= boundaryIndex ||
+			entry.type !== "message" ||
+			entry.message.role !== "assistant" ||
+			(entry.message.stopReason !== "error" && entry.message.stopReason !== "length")
+		) {
+			throw new SessionContextError();
+		}
+		collected.add(id);
+	}
+}
+
+/**
+ * 解析当前祖先链上的全部持久化 Overflow 排除项。
+ * 每次构建都重验图位置与 Message Role，防止修改后的 JSONL Checkpoint 隐藏任意 User/Tool 历史。
+ */
+function collectCompactionExcludedEntryIds(
+	path: readonly SessionEntry[],
+	additionalExcludedEntryIds: ReadonlySet<string> = new Set(),
+): ReadonlySet<string> {
+	const collected = new Set<string>();
+	for (let index = 0; index < path.length; index++) {
+		const entry = path[index];
+		if (entry.type !== "compaction" && entry.type !== "remote_compaction") continue;
+		if ("invalidExclusions" in entry && entry.invalidExclusions === true) throw new SessionContextError();
+		const excludedEntryIds = readCompactionExcludedEntryIds(entry);
+		if (excludedEntryIds !== undefined) {
+			validateCompactionExclusions(path, index, excludedEntryIds, collected);
+		}
+	}
+	validateCompactionExclusions(path, path.length, additionalExcludedEntryIds, collected);
+	return collected;
+}
+
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
@@ -729,8 +811,10 @@ export function buildContextEntries(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	additionalExcludedEntryIds: ReadonlySet<string> = new Set(),
 ): SessionEntry[] {
 	const path = buildSessionPath(entries, leafId, byId);
+	const excludedEntryIds = collectCompactionExcludedEntryIds(path, additionalExcludedEntryIds);
 	let checkpoint: CompactionEntry | RemoteCompactionEntry | InvalidRemoteCompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -740,15 +824,15 @@ export function buildContextEntries(
 	}
 
 	if (!checkpoint) {
-		return path;
+		return path.filter((entry) => !excludedEntryIds.has(entry.id));
 	}
 
 	const compactionIdx = path.findIndex((entry) => entry.id === checkpoint.id);
 	if (compactionIdx < 0) {
-		return path;
+		return path.filter((entry) => !excludedEntryIds.has(entry.id));
 	}
 	if (checkpoint.type === "remote_compaction") {
-		return [checkpoint, ...path.slice(compactionIdx + 1)];
+		return [checkpoint, ...path.slice(compactionIdx + 1)].filter((entry) => !excludedEntryIds.has(entry.id));
 	}
 
 	const contextEntries: SessionEntry[] = [checkpoint];
@@ -763,7 +847,7 @@ export function buildContextEntries(
 		}
 	}
 	contextEntries.push(...path.slice(compactionIdx + 1));
-	return contextEntries;
+	return contextEntries.filter((entry) => !excludedEntryIds.has(entry.id));
 }
 
 /**
@@ -775,10 +859,11 @@ export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	additionalExcludedEntryIds: ReadonlySet<string> = new Set(),
 ): SessionContext {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const contextEntries = buildContextEntries(entries, leafId, byId);
+	const contextEntries = buildContextEntries(entries, leafId, byId, additionalExcludedEntryIds);
 	const checkpoint = contextEntries[0];
 	if (checkpoint && isInvalidRemoteCompactionEntry(checkpoint)) {
 		throw new SessionContextError();
@@ -807,10 +892,11 @@ export function buildPortableRawEntries(
 	excludedEntryIds: ReadonlySet<string> = new Set(),
 ): SessionEntry[] {
 	const path = buildSessionPath(entries, leafId, byId);
+	const effectiveExcludedEntryIds = collectCompactionExcludedEntryIds(path, excludedEntryIds);
 	const portable: SessionEntry[] = [];
 	let parentId: string | null = null;
 	for (const entry of path) {
-		if (excludedEntryIds.has(entry.id)) continue;
+		if (effectiveExcludedEntryIds.has(entry.id)) continue;
 		if (entry.type !== "message" && entry.type !== "custom_message" && entry.type !== "branch_summary") {
 			continue;
 		}
@@ -1506,6 +1592,8 @@ export class SessionManager {
 		if (this.byId.has(options.entryId)) {
 			throw new Error(`Entry ${options.entryId} already exists`);
 		}
+		const excludedEntryIds = readCompactionExcludedEntryIds(options);
+		collectCompactionExcludedEntryIds(this.getBranch(), new Set(excludedEntryIds));
 
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1521,6 +1609,7 @@ export class SessionManager {
 			fromHook: options.fromHook,
 			metadata: options.metadata,
 		};
+		if (excludedEntryIds !== undefined) entry.excludedEntryIds = excludedEntryIds;
 		this._appendEntry(entry);
 		return entry;
 	}
@@ -1541,6 +1630,8 @@ export class SessionManager {
 		if (this.byId.has(options.entryId)) {
 			throw new Error(`Entry ${options.entryId} already exists`);
 		}
+		const excludedEntryIds = readCompactionExcludedEntryIds(options);
+		collectCompactionExcludedEntryIds(this.getBranch(), new Set(excludedEntryIds));
 
 		const normalized = normalizeParsedSessionEntry({
 			type: "remote_compaction",
@@ -1555,6 +1646,7 @@ export class SessionManager {
 			usage: options.usage,
 			providerContext: options.providerContext,
 			metadata: options.metadata,
+			...(excludedEntryIds === undefined ? {} : { excludedEntryIds }),
 		});
 		if (normalized.type !== "remote_compaction" || !isRemoteCompactionEntry(normalized)) {
 			throw new SessionContextError();
@@ -1742,8 +1834,8 @@ export class SessionManager {
 	 * Build the active, compaction-aware entry list for context/rendering.
 	 * Uses tree traversal from current leaf.
 	 */
-	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+	buildContextEntries(additionalExcludedEntryIds: ReadonlySet<string> = new Set()): SessionEntry[] {
+		return buildContextEntries(this.getEntries(), this.leafId, this.byId, additionalExcludedEntryIds);
 	}
 
 	/** Build a flat, checkpoint-free copy of the current leaf's raw semantic ancestry. */
@@ -1755,8 +1847,8 @@ export class SessionManager {
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
-	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+	buildSessionContext(additionalExcludedEntryIds: ReadonlySet<string> = new Set()): SessionContext {
+		return buildSessionContext(this.getEntries(), this.leafId, this.byId, additionalExcludedEntryIds);
 	}
 
 	/**

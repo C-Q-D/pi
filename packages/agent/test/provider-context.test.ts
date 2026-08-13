@@ -262,6 +262,56 @@ describe("Agent provider context", () => {
 		expect(wrapper).not.toHaveBeenCalled();
 	});
 
+	it("continues directly from an opaque provider context without synthesizing a user message", async () => {
+		const seenMessageCounts: number[] = [];
+		const seenConvertedCounts: number[] = [];
+		const convertToLlm = vi.fn((messages: AgentMessage[]) => {
+			seenConvertedCounts.push(messages.length);
+			return identityConverter(messages);
+		});
+		const streamFn = declaredStream(
+			vi.fn((_model, context) => {
+				seenMessageCounts.push(context.messages.length);
+				return completedStream(assistantMessage([{ type: "text", text: "continued" }]));
+			}),
+		);
+		const agent = new Agent({ streamFn, convertToLlm, initialState: { model: model() } });
+		agent.replaceContext({ messages: [], providerContext: providerContext() });
+
+		await agent.continue();
+
+		expect(streamFn).toHaveBeenCalledTimes(1);
+		expect(convertToLlm).toHaveBeenCalledTimes(1);
+		expect(seenConvertedCounts).toEqual([0]);
+		expect(seenMessageCounts).toEqual([0]);
+		expect(agent.state.messages).toHaveLength(1);
+		expect(agent.state.messages[0]).toMatchObject({ role: "assistant", content: [{ text: "continued" }] });
+		expect(agent.state.messages.some((message) => message.role === "user")).toBe(false);
+	});
+
+	it("keeps empty continuation closed without provider context or a declared consumer", async () => {
+		const emptyAgent = new Agent({ streamFn: () => completedStream(), initialState: { model: model() } });
+		await expect(emptyAgent.continue()).rejects.toThrow("No messages to continue from");
+
+		const transformContext = vi.fn(async (messages: AgentMessage[]) => messages);
+		const convertToLlm = vi.fn(identityConverter);
+		const streamFn = vi.fn(() => completedStream());
+		const undeclaredAgent = new Agent({
+			streamFn,
+			transformContext,
+			convertToLlm,
+			initialState: { model: model() },
+		});
+		undeclaredAgent.replaceContext({ messages: [], providerContext: providerContext() });
+
+		await undeclaredAgent.continue();
+
+		expect(transformContext).not.toHaveBeenCalled();
+		expect(convertToLlm).not.toHaveBeenCalled();
+		expect(streamFn).not.toHaveBeenCalled();
+		expect(undeclaredAgent.state.errorMessage).toBe("Native compaction is not supported.");
+	});
+
 	it("synchronizes a complete prepareNextTurn context into the loop and Agent state", async () => {
 		const schema = Type.Object({});
 		const tool: AgentTool<typeof schema> = {

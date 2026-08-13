@@ -132,7 +132,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
-	it("should not compact repeatedly after overflow recovery already attempted", async () => {
+	it("should fail closed once when an overflow message has no exact persisted entry identity", async () => {
 		const model = session.model!;
 		const overflowMessage: AssistantMessage = {
 			role: "assistant",
@@ -176,15 +176,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 		)._checkCompaction.bind(session);
 
 		await checkCompaction(overflowMessage);
-		await checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
+		await checkCompaction(overflowMessage);
 
-		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
-		expect(events).toContainEqual({
-			type: "compaction_end",
-			reason: "overflow",
-			errorMessage:
-				"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-		});
+		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		expect(events).toEqual([
+			{
+				type: "compaction_end",
+				reason: "overflow",
+				errorMessage: "Context overflow recovery failed: Compaction input is invalid.",
+			},
+		]);
 	});
 
 	it("should ignore stale pre-compaction assistant usage on pre-prompt compaction checks", async () => {

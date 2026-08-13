@@ -1,6 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, getUserTexts, type Harness } from "../harness.ts";
+import { createHarness, type Harness } from "../harness.ts";
 
 function createUsage(totalTokens: number) {
 	return {
@@ -23,7 +23,7 @@ describe("pre-prompt compaction regression", () => {
 		}
 	});
 
-	it("compacts length-stop overflow before a new prompt without continuing from an assistant message", async () => {
+	it("does not guess a restored length-stop entry identity before a new prompt", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
@@ -64,12 +64,13 @@ describe("pre-prompt compaction regression", () => {
 		await expect(harness.session.prompt("next prompt")).resolves.toBeUndefined();
 
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+		expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
 			reason: "overflow",
 			aborted: false,
-			willRetry: true,
+			willRetry: false,
+			errorCode: "invalid_context",
 		});
-		expect(getUserTexts(harness)).toContain("next prompt");
+		expect(JSON.stringify(harness.sessionManager.getEntries())).toContain("next prompt");
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 });
