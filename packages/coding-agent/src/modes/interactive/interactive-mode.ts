@@ -51,7 +51,12 @@ import {
 	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type CompactOptions,
+	parseSkillBlock,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import {
 	CACHE_TTL_MS,
@@ -60,7 +65,11 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
-import { createSanitizedCompactionResult, sanitizeCompactionError } from "../../core/compaction/index.ts";
+import {
+	createSanitizedCompactionResult,
+	type SanitizedCompactionResult,
+	sanitizeCompactionError,
+} from "../../core/compaction/index.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -76,7 +85,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
-import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
@@ -200,7 +208,70 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+export type CompactCommandParseResult =
+	| { readonly ok: true; readonly options: CompactOptions }
+	| { readonly ok: false; readonly error: string };
+
+const COMPACT_COMMAND_USAGE = "Usage: /compact [--local [instructions] | --remote | instructions]";
+
+/** 解析 `/compact` 参数；任何错误都在创建 Compaction Attempt 前返回。 */
+export function parseCompactCommandArguments(rawArguments?: string): CompactCommandParseResult {
+	const input = rawArguments?.trim() ?? "";
+	if (!input) return { ok: true, options: { requestedStrategy: "local" } };
+	if (!input.startsWith("--")) {
+		return { ok: true, options: { requestedStrategy: "local", customInstructions: input } };
+	}
+
+	const firstSpace = input.search(/\s/);
+	const firstToken = firstSpace < 0 ? input : input.slice(0, firstSpace);
+	let remainder = firstSpace < 0 ? "" : input.slice(firstSpace).trim();
+	if (firstToken === "--") {
+		return {
+			ok: true,
+			options: {
+				requestedStrategy: "local",
+				customInstructions: remainder || undefined,
+			},
+		};
+	}
+	if (firstToken !== "--local" && firstToken !== "--remote") {
+		return { ok: false, error: COMPACT_COMMAND_USAGE };
+	}
+
+	const requestedStrategy = firstToken === "--remote" ? "remote" : "local";
+	const nextSpace = remainder.search(/\s/);
+	const nextToken = nextSpace < 0 ? remainder : remainder.slice(0, nextSpace);
+	if (nextToken === "--local" || nextToken === "--remote") {
+		return { ok: false, error: "Choose only one compaction strategy." };
+	}
+	if (nextToken === "--") {
+		remainder = nextSpace < 0 ? "" : remainder.slice(nextSpace).trim();
+	} else if (nextToken.startsWith("--")) {
+		return { ok: false, error: COMPACT_COMMAND_USAGE };
+	}
+	if (requestedStrategy === "remote" && remainder) {
+		return { ok: false, error: "Remote compaction does not accept custom instructions." };
+	}
+
+	return {
+		ok: true,
+		options: {
+			requestedStrategy,
+			customInstructions: remainder || undefined,
+		},
+	};
+}
+
+interface CompactionRenderItem {
+	readonly kind: "compaction";
+	readonly result: SanitizedCompactionResult;
+}
+
+type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }> | CompactionRenderItem;
+
+function isCompactionRenderItem(item: RenderSessionItem): item is CompactionRenderItem {
+	return "kind" in item && item.kind === "compaction";
+}
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
@@ -1825,12 +1896,21 @@ export class InteractiveMode {
 			getContextUsage: () => this.session.getContextUsage(),
 			compact: (options) => {
 				void (async () => {
+					let result: SanitizedCompactionResult;
 					try {
-						const result = await this.session.compact(options?.customInstructions);
-						options?.onComplete?.(createSanitizedCompactionResult(result, { reason: "manual" }));
+						result = await this.session.compact({
+							requestedStrategy: options?.requestedStrategy,
+							customInstructions: options?.customInstructions,
+						});
 					} catch (error) {
-						options?.onError?.(sanitizeCompactionError(error));
+						try {
+							options?.onError?.(sanitizeCompactionError(error));
+						} catch {}
+						return;
 					}
+					try {
+						options?.onComplete?.(createSanitizedCompactionResult(result, { reason: "manual" }));
+					} catch {}
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
@@ -2762,9 +2842,9 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/compact" || text.startsWith("/compact ")) {
-				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
+				const compactArguments = text.slice("/compact".length).trim();
 				this.editor.setText("");
-				await this.handleCompactCommand(customInstructions);
+				await this.handleCompactCommand(compactArguments);
 				return;
 			}
 			if (text === "/reload") {
@@ -3110,13 +3190,6 @@ export class InteractiveMode {
 				} else if (event.result) {
 					this.chatContainer.clear();
 					this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-					);
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3276,10 +3349,7 @@ export class InteractiveMode {
 				break;
 			}
 			case "compactionSummary": {
-				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
-				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				this.addCompactionToChat(createSanitizedCompactionResult(message));
 				break;
 			}
 			case "branchSummary": {
@@ -3349,6 +3419,13 @@ export class InteractiveMode {
 		}
 	}
 
+	private addCompactionToChat(result: SanitizedCompactionResult): void {
+		this.chatContainer.addChild(new Spacer(1));
+		const component = new CompactionSummaryMessageComponent(result, this.getMarkdownThemeWithSettings());
+		component.setExpanded(this.toolOutputExpanded);
+		this.chatContainer.addChild(component);
+	}
+
 	private renderSessionItems(
 		items: readonly RenderSessionItem[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
@@ -3367,6 +3444,10 @@ export class InteractiveMode {
 		}
 
 		for (const item of items) {
+			if (isCompactionRenderItem(item)) {
+				this.addCompactionToChat(item.result);
+				continue;
+			}
 			if (isCustomSessionEntry(item)) {
 				this.addCustomEntryToChat(item);
 				continue;
@@ -3448,6 +3529,9 @@ export class InteractiveMode {
 			if (entry.type === "custom") {
 				return [entry];
 			}
+			if (entry.type === "compaction" || entry.type === "remote_compaction") {
+				return [{ kind: "compaction", result: createSanitizedCompactionResult(entry) }];
+			}
 			return sessionEntryToContextMessages(entry);
 		});
 		this.renderSessionItems(items, options);
@@ -3492,7 +3576,9 @@ export class InteractiveMode {
 
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
-		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
+		const compactionCount = allEntries.filter(
+			(entry) => entry.type === "compaction" || entry.type === "remote_compaction",
+		).length;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Session compacted ${times}`);
@@ -6033,11 +6119,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private async handleCompactCommand(customInstructions?: string): Promise<void> {
+	private async handleCompactCommand(rawArguments?: string): Promise<void> {
 		this.clearStatusIndicator();
+		const parsed = parseCompactCommandArguments(rawArguments);
+		if (!parsed.ok) {
+			this.showError(parsed.error);
+			return;
+		}
 
 		try {
-			await this.session.compact(customInstructions);
+			await this.session.compact(parsed.options);
 		} catch {
 			// Ignore, will be emitted as an event
 		}
