@@ -467,11 +467,10 @@ describe("Agent", () => {
 		expect(agent.state.messages).toEqual(messages);
 		expect(agent.state.messages).not.toBe(messages); // Should be a copy
 
-		// Test appendMessage
+		// Mutating a getter snapshot must not mutate internal state.
 		const newMessage = { role: "assistant" as const, content: [{ type: "text" as const, text: "Hi" }] };
 		agent.state.messages.push(newMessage as any);
-		expect(agent.state.messages).toHaveLength(2);
-		expect(agent.state.messages[1]).toBe(newMessage);
+		expect(agent.state.messages).toHaveLength(1);
 
 		// Test clearMessages
 		agent.state.messages = [];

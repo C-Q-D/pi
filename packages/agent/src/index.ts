@@ -45,6 +45,6 @@ export * from "./harness/utils/truncate.ts";
 // Proxy utilities
 export * from "./proxy.ts";
 // Stream defaults
-export { setDefaultStreamFn } from "./stream-fn.ts";
+export { declareStreamFnHandlesProviderContext, setDefaultStreamFn } from "./stream-fn.ts";
 // Types
 export * from "./types.ts";

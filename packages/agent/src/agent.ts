@@ -7,6 +7,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
+import { cloneAndFreezeProviderContext, createNativeCompactionError } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
@@ -64,13 +65,45 @@ type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "
 	errorMessage?: string;
 };
 
+const ACTIVE_CONTEXT_REPLACEMENT_ERROR = "Cannot replace context while the agent is processing.";
+
+function cloneProviderContextProperty(value: object): AgentState["providerContext"] {
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(value, "providerContext");
+		if (!descriptor) return undefined;
+		if (!descriptor.enumerable || !("value" in descriptor)) throw createNativeCompactionError("invalid_context");
+		return descriptor.value === undefined ? undefined : cloneAndFreezeProviderContext(descriptor.value);
+	} catch {
+		throw createNativeCompactionError("invalid_context");
+	}
+}
+
 function createMutableAgentState(
 	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
-): MutableAgentState {
+	isActive: () => boolean = () => false,
+): {
+	state: MutableAgentState;
+	replaceContext: (messages: AgentMessage[], providerContext: AgentState["providerContext"]) => void;
+	appendMessage: (message: AgentMessage) => void;
+} {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
+	let providerContext = initialState ? cloneProviderContextProperty(initialState) : undefined;
+	const assertIdle = () => {
+		if (isActive()) throw new Error(ACTIVE_CONTEXT_REPLACEMENT_ERROR);
+	};
+	const replaceContext = (nextMessages: AgentMessage[], nextProviderContext: AgentState["providerContext"]) => {
+		const messagesSnapshot = nextMessages.slice();
+		const providerContextSnapshot =
+			nextProviderContext === undefined ? undefined : cloneAndFreezeProviderContext(nextProviderContext);
+		messages = messagesSnapshot;
+		providerContext = providerContextSnapshot;
+	};
+	const appendMessage = (message: AgentMessage) => {
+		messages.push(message);
+	};
 
-	return {
+	const state: MutableAgentState = {
 		systemPrompt: initialState?.systemPrompt ?? "",
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
@@ -81,16 +114,27 @@ function createMutableAgentState(
 			tools = nextTools.slice();
 		},
 		get messages() {
-			return messages;
+			return messages.slice();
 		},
 		set messages(nextMessages: AgentMessage[]) {
+			assertIdle();
 			messages = nextMessages.slice();
+			providerContext = undefined;
+		},
+		get providerContext() {
+			return providerContext === undefined ? undefined : cloneAndFreezeProviderContext(providerContext);
+		},
+		set providerContext(nextProviderContext) {
+			assertIdle();
+			providerContext =
+				nextProviderContext === undefined ? undefined : cloneAndFreezeProviderContext(nextProviderContext);
 		},
 		isStreaming: false,
 		streamingMessage: undefined,
 		pendingToolCalls: new Set<string>(),
 		errorMessage: undefined,
 	};
+	return { state, replaceContext, appendMessage };
 }
 
 /** Options for constructing an {@link Agent}. */
@@ -118,6 +162,63 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+}
+
+export interface AgentContextReplacement {
+	messages: AgentMessage[];
+	providerContext?: AgentState["providerContext"];
+}
+
+function cloneAgentContext(context: AgentContext): AgentContext {
+	const providerContext = cloneProviderContextProperty(context);
+	return {
+		systemPrompt: context.systemPrompt,
+		messages: context.messages.slice(),
+		tools: context.tools?.slice(),
+		...(providerContext === undefined ? {} : { providerContext }),
+	};
+}
+
+const AGENT_LOOP_TURN_UPDATE_KEYS = new Set(["context", "model", "thinkingLevel"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function cloneAgentLoopTurnUpdate(update: AgentLoopTurnUpdate): AgentLoopTurnUpdate {
+	try {
+		if (typeof update !== "object" || update === null) throw createNativeCompactionError("invalid_context");
+		const prototype = Object.getPrototypeOf(update);
+		if (prototype !== Object.prototype && prototype !== null) throw createNativeCompactionError("invalid_context");
+		const keys = Reflect.ownKeys(update);
+		for (const key of keys) {
+			if (typeof key !== "string" || !AGENT_LOOP_TURN_UPDATE_KEYS.has(key)) {
+				throw createNativeCompactionError("invalid_context");
+			}
+		}
+		const readDataProperty = (key: "context" | "model" | "thinkingLevel"): unknown => {
+			const descriptor = Object.getOwnPropertyDescriptor(update, key);
+			if (!descriptor) return undefined;
+			if (!descriptor.enumerable || !("value" in descriptor)) throw createNativeCompactionError("invalid_context");
+			return descriptor.value;
+		};
+		const contextValue = readDataProperty("context");
+		const model = readDataProperty("model");
+		const thinkingLevel = readDataProperty("thinkingLevel");
+		if (model !== undefined && (typeof model !== "object" || model === null)) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		if (thinkingLevel !== undefined && (typeof thinkingLevel !== "string" || !THINKING_LEVELS.has(thinkingLevel))) {
+			throw createNativeCompactionError("invalid_context");
+		}
+		const context = contextValue === undefined ? undefined : cloneAgentContext(contextValue as AgentContext);
+		return {
+			...(context === undefined ? {} : { context }),
+			...(model === undefined ? {} : { model: model as AgentLoopTurnUpdate["model"] }),
+			...(thinkingLevel === undefined
+				? {}
+				: { thinkingLevel: thinkingLevel as AgentLoopTurnUpdate["thinkingLevel"] }),
+		};
+	} catch {
+		throw createNativeCompactionError("invalid_context");
+	}
 }
 
 class PendingMessageQueue {
@@ -170,6 +271,11 @@ type ActiveRun = {
  */
 export class Agent {
 	private _state: MutableAgentState;
+	private readonly replaceStateContext: (
+		messages: AgentMessage[],
+		providerContext: AgentState["providerContext"],
+	) => void;
+	private readonly appendStateMessage: (message: AgentMessage) => void;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
@@ -210,7 +316,10 @@ export class Agent {
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
 		const runtimeOptions: Partial<AgentOptions> = options ?? {};
-		this._state = createMutableAgentState(runtimeOptions.initialState);
+		const mutableState = createMutableAgentState(runtimeOptions.initialState, () => this.activeRun !== undefined);
+		this._state = mutableState.state;
+		this.replaceStateContext = mutableState.replaceContext;
+		this.appendStateMessage = mutableState.appendMessage;
 		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
 		this.transformContext = runtimeOptions.transformContext;
 		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
@@ -248,7 +357,8 @@ export class Agent {
 	/**
 	 * Current agent state.
 	 *
-	 * Assigning `state.tools` or `state.messages` copies the provided top-level array.
+	 * Assigning `state.tools` or `state.messages` copies the provided top-level array;
+	 * reading `state.messages` also returns a top-level copy.
 	 */
 	get state(): AgentState {
 		return this._state;
@@ -325,12 +435,19 @@ export class Agent {
 	/** Clear transcript state, runtime state, and queued messages. */
 	reset(): void {
 		this._state.messages = [];
+		this._state.providerContext = undefined;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
+	}
+
+	/** Atomically replace the transcript and its bound provider context while idle. */
+	replaceContext(replacement: AgentContextReplacement): void {
+		if (this.activeRun) throw new Error(ACTIVE_CONTEXT_REPLACEMENT_ERROR);
+		this.replaceStateContext(replacement.messages, cloneProviderContextProperty(replacement));
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
@@ -352,7 +469,8 @@ export class Agent {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
 
-		const lastMessage = this._state.messages[this._state.messages.length - 1];
+		const messages = this._state.messages;
+		const lastMessage = messages[messages.length - 1];
 		if (!lastMessage) {
 			throw new Error("No messages to continue from");
 		}
@@ -424,10 +542,12 @@ export class Agent {
 	}
 
 	private createContextSnapshot(): AgentContext {
+		const providerContext = this._state.providerContext;
 		return {
 			systemPrompt: this._state.systemPrompt,
-			messages: this._state.messages.slice(),
+			messages: this._state.messages,
 			tools: this._state.tools.slice(),
+			...(providerContext === undefined ? {} : { providerContext }),
 		};
 	}
 
@@ -448,10 +568,26 @@ export class Agent {
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {
-							if (this.prepareNextTurnWithContext) {
-								return await this.prepareNextTurnWithContext(context, this.signal);
+							const rawUpdate = this.prepareNextTurnWithContext
+								? await this.prepareNextTurnWithContext(context, this.signal)
+								: await this.prepareNextTurn?.(this.signal);
+							if (this.signal?.aborted) throw createNativeCompactionError("aborted");
+							if (rawUpdate === undefined) return undefined;
+							const update = cloneAgentLoopTurnUpdate(rawUpdate);
+							const contextSnapshot = update.context;
+							const returnSnapshot: AgentLoopTurnUpdate = {
+								...(contextSnapshot === undefined ? {} : { context: cloneAgentContext(contextSnapshot) }),
+								...(update.model === undefined ? {} : { model: update.model }),
+								...(update.thinkingLevel === undefined ? {} : { thinkingLevel: update.thinkingLevel }),
+							};
+							if (contextSnapshot) {
+								this.replaceStateContext(contextSnapshot.messages, contextSnapshot.providerContext);
+								this._state.systemPrompt = contextSnapshot.systemPrompt;
+								this._state.tools = contextSnapshot.tools ?? [];
 							}
-							return await this.prepareNextTurn?.(this.signal);
+							if (update.model) this._state.model = update.model;
+							if (update.thinkingLevel) this._state.thinkingLevel = update.thinkingLevel;
+							return returnSnapshot;
 						}
 					: undefined,
 			convertToLlm: this.convertToLlm,
@@ -538,7 +674,7 @@ export class Agent {
 
 			case "message_end":
 				this._state.streamingMessage = undefined;
-				this._state.messages.push(event.message);
+				this.appendStateMessage(event.message);
 				break;
 
 			case "tool_execution_start": {

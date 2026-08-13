@@ -6,11 +6,14 @@
 import {
 	type AssistantMessage,
 	type Context,
+	cloneAndFreezeProviderContext,
+	createNativeCompactionError,
 	EventStream,
+	sanitizeNativeCompactionError,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
-import { getDefaultStreamFn } from "./stream-fn.ts";
+import { getDefaultStreamFn, streamFnHandlesProviderContext } from "./stream-fn.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -24,6 +27,101 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+const EMPTY_USAGE = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function cloneAgentContext(context: AgentContext): AgentContext {
+	let providerContext: AgentContext["providerContext"];
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(context, "providerContext");
+		if (descriptor) {
+			if (!descriptor.enumerable || !("value" in descriptor)) {
+				throw createNativeCompactionError("invalid_context");
+			}
+			providerContext = descriptor.value === undefined ? undefined : cloneAndFreezeProviderContext(descriptor.value);
+		}
+	} catch {
+		throw createNativeCompactionError("invalid_context");
+	}
+	return {
+		systemPrompt: context.systemPrompt,
+		messages: context.messages.slice(),
+		tools: context.tools?.slice(),
+		...(providerContext === undefined ? {} : { providerContext }),
+	};
+}
+
+interface AgentLoopLifecycle {
+	agentStarted: boolean;
+	turnOpen: boolean;
+	completedMessages: AgentMessage[];
+	completedPromptCount: number;
+}
+
+function pushAgentLoopEvent(
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	lifecycle: AgentLoopLifecycle,
+	event: AgentEvent,
+	prompts: AgentMessage[],
+): void {
+	if (event.type === "agent_start") lifecycle.agentStarted = true;
+	if (event.type === "turn_start") lifecycle.turnOpen = true;
+	if (event.type === "turn_end") lifecycle.turnOpen = false;
+	if (event.type === "message_end") {
+		lifecycle.completedMessages.push(event.message);
+		if (
+			lifecycle.completedPromptCount < prompts.length &&
+			event.message === prompts[lifecycle.completedPromptCount]
+		) {
+			lifecycle.completedPromptCount++;
+		}
+	}
+	stream.push(event);
+}
+
+function settleAgentLoopFailure(
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	error: unknown,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	lifecycle: AgentLoopLifecycle,
+	prompts: AgentMessage[],
+): void {
+	const safeError = sanitizeNativeCompactionError(error, signal?.aborted ? "aborted" : "provider_error");
+	if (!lifecycle.agentStarted) {
+		pushAgentLoopEvent(stream, lifecycle, { type: "agent_start" }, prompts);
+	}
+	if (!lifecycle.turnOpen) {
+		pushAgentLoopEvent(stream, lifecycle, { type: "turn_start" }, prompts);
+	}
+	for (let index = lifecycle.completedPromptCount; index < prompts.length; index++) {
+		const prompt = prompts[index]!;
+		pushAgentLoopEvent(stream, lifecycle, { type: "message_start", message: prompt }, prompts);
+		pushAgentLoopEvent(stream, lifecycle, { type: "message_end", message: prompt }, prompts);
+	}
+	const message = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: EMPTY_USAGE,
+		stopReason: safeError.code === "aborted" ? "aborted" : "error",
+		errorMessage: safeError.message,
+		timestamp: Date.now(),
+	} satisfies AssistantMessage;
+	pushAgentLoopEvent(stream, lifecycle, { type: "message_start", message }, prompts);
+	pushAgentLoopEvent(stream, lifecycle, { type: "message_end", message }, prompts);
+	pushAgentLoopEvent(stream, lifecycle, { type: "turn_end", message, toolResults: [] }, prompts);
+	pushAgentLoopEvent(stream, lifecycle, { type: "agent_end", messages: lifecycle.completedMessages.slice() }, prompts);
+}
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -36,19 +134,30 @@ export function agentLoop(
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
+	const lifecycle: AgentLoopLifecycle = {
+		agentStarted: false,
+		turnOpen: false,
+		completedMessages: [],
+		completedPromptCount: 0,
+	};
 
 	void runAgentLoop(
 		prompts,
 		context,
 		config,
 		async (event) => {
-			stream.push(event);
+			pushAgentLoopEvent(stream, lifecycle, event, prompts);
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error: unknown) => {
+			settleAgentLoopFailure(stream, error, config, signal, lifecycle, prompts);
+		},
+	);
 
 	return stream;
 }
@@ -76,18 +185,30 @@ export function agentLoopContinue(
 	}
 
 	const stream = createAgentStream();
+	const lifecycle: AgentLoopLifecycle = {
+		agentStarted: false,
+		turnOpen: false,
+		completedMessages: [],
+		completedPromptCount: 0,
+	};
+	const prompts: AgentMessage[] = [];
 
 	void runAgentLoopContinue(
 		context,
 		config,
 		async (event) => {
-			stream.push(event);
+			pushAgentLoopEvent(stream, lifecycle, event, prompts);
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error: unknown) => {
+			settleAgentLoopFailure(stream, error, config, signal, lifecycle, prompts);
+		},
+	);
 
 	return stream;
 }
@@ -101,10 +222,8 @@ export async function runAgentLoop(
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
 	const newMessages: AgentMessage[] = [...prompts];
-	const currentContext: AgentContext = {
-		...context,
-		messages: [...context.messages, ...prompts],
-	};
+	const currentContext = cloneAgentContext(context);
+	currentContext.messages.push(...prompts);
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
@@ -133,7 +252,7 @@ export async function runAgentLoopContinue(
 	}
 
 	const newMessages: AgentMessage[] = [];
-	const currentContext: AgentContext = { ...context };
+	const currentContext = cloneAgentContext(context);
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
@@ -230,8 +349,10 @@ async function runLoop(
 				newMessages,
 			};
 			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
+			if (signal?.aborted) throw createNativeCompactionError("aborted");
 			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
+				currentContext =
+					nextTurnSnapshot.context === undefined ? currentContext : cloneAgentContext(nextTurnSnapshot.context);
 				config = {
 					...config,
 					model: nextTurnSnapshot.model ?? config.model,
@@ -285,36 +406,49 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
+	if (context.providerContext !== undefined && !streamFnHandlesProviderContext(streamFunction)) {
+		throw createNativeCompactionError("unsupported");
+	}
+
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
+		if (signal?.aborted) throw createNativeCompactionError("aborted");
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
 
 	// Build LLM context
 	const llmContext: Context = {
 		systemPrompt: context.systemPrompt,
 		messages: llmMessages,
 		tools: context.tools,
+		...(context.providerContext === undefined
+			? {}
+			: { providerContext: cloneAndFreezeProviderContext(context.providerContext) }),
 	};
 
 	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	const dynamicApiKey = config.getApiKey ? await config.getApiKey(config.model.provider) : undefined;
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
+	const resolvedApiKey = dynamicApiKey || config.apiKey;
 
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
 	});
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
 	for await (const event of response) {
+		if (signal?.aborted) throw createNativeCompactionError("aborted");
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
@@ -346,6 +480,7 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await response.result();
+				if (signal?.aborted) throw createNativeCompactionError("aborted");
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
@@ -361,6 +496,7 @@ async function streamAssistantResponse(
 	}
 
 	const finalMessage = await response.result();
+	if (signal?.aborted) throw createNativeCompactionError("aborted");
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {

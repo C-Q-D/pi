@@ -7,6 +7,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderContextEnvelope,
 	SimpleStreamOptions,
 	TextContent,
 	Tool,
@@ -25,11 +26,14 @@ import type { Static, TSchema } from "typebox";
  * - Failures must be encoded in the returned stream via protocol events and a
  *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
  */
-export type StreamFn = (
-	model: Model<Api>,
-	context: Context,
-	options?: SimpleStreamOptions,
-) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+export interface StreamFn {
+	// biome-ignore lint/style/useShorthandFunctionType: This public callable interface is an explicit capability seam.
+	(
+		model: Model<Api>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	): AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+}
 
 /**
  * Configuration for how tool calls from a single assistant message are executed.
@@ -334,9 +338,12 @@ export interface AgentState {
 	/** Available tools. Assigning a new array copies the top-level array. */
 	set tools(tools: AgentTool<any>[]);
 	get tools(): AgentTool<any>[];
-	/** Conversation transcript. Assigning a new array copies the top-level array. */
+	/** Conversation transcript. Both assigning and reading copy the top-level array. */
 	set messages(messages: AgentMessage[]);
 	get messages(): AgentMessage[];
+	/** Opaque provider context bound to the current transcript. Assigning validates and deep-copies it. */
+	set providerContext(providerContext: ProviderContextEnvelope | undefined);
+	get providerContext(): ProviderContextEnvelope | undefined;
 	/**
 	 * True while the agent is processing a prompt or continuation.
 	 *
@@ -410,6 +417,8 @@ export interface AgentContext {
 	messages: AgentMessage[];
 	/** Tools available for this run. */
 	tools?: AgentTool<any>[];
+	/** Opaque provider state carried independently from messages. */
+	providerContext?: ProviderContextEnvelope;
 }
 
 /**

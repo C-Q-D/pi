@@ -692,6 +692,14 @@ export class AgentSession {
 		return undefined;
 	}
 
+	private _appendAgentStateMessage(message: AgentMessage): void {
+		const providerContext = this.agent.state.providerContext;
+		this.agent.replaceContext({
+			messages: [...this.agent.state.messages, message],
+			...(providerContext === undefined ? {} : { providerContext }),
+		});
+	}
+
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
 		// Agent-core stores the finalized message object in its state before emitting message_end.
 		// SessionManager persistence happens later in _handleAgentEvent() with event.message.
@@ -1450,7 +1458,7 @@ export class AgentSession {
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
 		} else {
-			this.agent.state.messages.push(appMessage);
+			this._appendAgentStateMessage(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
 				message.customType,
 				message.content,
@@ -2819,7 +2827,7 @@ export class AgentSession {
 			this._pendingBashMessages.push(bashMessage);
 		} else {
 			// Add to agent state immediately
-			this.agent.state.messages.push(bashMessage);
+			this._appendAgentStateMessage(bashMessage);
 
 			// Save to session
 			this.sessionManager.appendMessage(bashMessage);
@@ -2854,7 +2862,7 @@ export class AgentSession {
 
 		for (const bashMessage of this._pendingBashMessages) {
 			// Add to agent state
-			this.agent.state.messages.push(bashMessage);
+			this._appendAgentStateMessage(bashMessage);
 
 			// Save to session
 			this.sessionManager.appendMessage(bashMessage);
