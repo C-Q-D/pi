@@ -410,6 +410,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _activeCompactionAttempt: ActiveCompactionAttempt | undefined = undefined;
+	private readonly _thresholdCompactionEvaluatedMessages = new WeakSet<AssistantMessage>();
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -1944,7 +1945,11 @@ export class AgentSession {
 		this._disconnectFromAgent();
 
 		try {
-			await this.abort();
+			// Manual compaction may interrupt an active turn. Threshold compaction is
+			// entered from _handlePostAgentRun after agent.prompt() has settled, while
+			// the outer Session run intentionally remains active to drain its queues.
+			// Waiting for Session idle there would wait on the current run itself.
+			if (options.reason === "manual") await this.abort();
 			this._throwIfCompactionAborted();
 			attempt.startingLeafId = this.sessionManager.getLeafId();
 			this._emit({ type: "compaction_start", reason: options.reason });
@@ -1959,7 +1964,9 @@ export class AgentSession {
 				aborted,
 				willRetry: attempt.committed ? options.willRetry : false,
 				errorCode: sanitizedError.code,
-				errorMessage: aborted ? undefined : `Compaction failed: ${sanitizedError.message}`,
+				errorMessage: aborted
+					? undefined
+					: `${options.reason === "threshold" ? "Auto-compaction" : "Compaction"} failed: ${sanitizedError.message}`,
 			});
 			throw sanitizedError;
 		} finally {
@@ -2395,6 +2402,10 @@ export class AgentSession {
 		}
 
 		// Case 2: Threshold - context is getting large
+		// A failed threshold attempt is retried only after another complete turn.
+		// The pre-prompt guard may inspect the same Assistant Message again, but it
+		// must not turn that inspection into a second attempt for the same turn.
+		if (this._thresholdCompactionEvaluatedMessages.has(assistantMessage)) return false;
 		// For error messages or all-zero usage messages, estimate from the last valid response.
 		// This ensures sessions that hit persistent API errors (e.g. 529) or malformed zero-usage
 		// responses can still compact and do not reset context accounting.
@@ -2420,6 +2431,7 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			this._thresholdCompactionEvaluatedMessages.add(assistantMessage);
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -2429,6 +2441,24 @@ export class AgentSession {
 	 * Internal: Run auto-compaction with events.
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		if (reason === "threshold") {
+			try {
+				await this._runCompactionAttempt({
+					reason,
+					requestedStrategy: this.compactionStrategy,
+					excludedEntryIds: new Set(),
+					willRetry: false,
+				});
+				// _handlePostAgentRun owns the continuation. Returning true only when
+				// Agent-level work is waiting preserves its existing queue order.
+				return this.agent.hasQueuedMessages();
+			} catch {
+				// The shared FSM already emitted the single sanitized terminal event.
+				// A later complete turn may evaluate the threshold again.
+				return false;
+			}
+		}
+
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 

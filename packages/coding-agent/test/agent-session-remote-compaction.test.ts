@@ -46,6 +46,10 @@ interface Harness {
 	readonly tempDir: string;
 }
 
+interface SessionWithAutoCompaction {
+	_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
+}
+
 function nativeResult(label: string): FauxCompactionFactory {
 	return (request) => ({
 		providerContext: {
@@ -117,6 +121,10 @@ describe("AgentSession manual remote compaction transaction", () => {
 			expect(error).toBeInstanceOf(CompactionBoundaryError);
 			expect((error as CompactionBoundaryError).code).toBe(code);
 		}
+	}
+
+	function runThresholdCompaction(session: AgentSession): Promise<boolean> {
+		return (session as unknown as SessionWithAutoCompaction)._runAutoCompaction("threshold", false);
 	}
 
 	it("runs remote, continues with the opaque checkpoint, then compacts remotely again", async () => {
@@ -248,6 +256,163 @@ describe("AgentSession manual remote compaction transaction", () => {
 		expect(automatic.faux.nativeCompaction!.state.compactCallCount).toBe(1);
 		expect(automatic.faux.state.callCount).toBe(1);
 		expect(automatic.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+	});
+
+	it("routes threshold compaction through configured Local, Remote, and one-shot Auto fallback", async () => {
+		const local = await createHarness({ strategy: "local" });
+		const localEvents: AgentSessionEvent[] = [];
+		local.session.subscribe((event) => localEvents.push(event));
+		local.faux.setResponses([fauxAssistantMessage("threshold local summary")]);
+
+		await expect(runThresholdCompaction(local.session)).resolves.toBe(false);
+
+		expect(local.faux.state.callCount).toBe(1);
+		expect(local.faux.nativeCompaction!.state.compactCallCount).toBe(0);
+		expect(local.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(localEvents.filter((event) => event.type === "compaction_start")).toHaveLength(1);
+		expect(localEvents.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({
+				reason: "threshold",
+				result: expect.objectContaining({
+					metadata: expect.objectContaining({ requestedStrategy: "local", effectiveStrategy: "local" }),
+				}),
+			}),
+		]);
+
+		const remote = await createHarness({ strategy: "remote" });
+		remote.faux.nativeCompaction!.setResults([nativeResult("threshold-remote")]);
+
+		await expect(runThresholdCompaction(remote.session)).resolves.toBe(false);
+
+		expect(remote.faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(remote.faux.state.callCount).toBe(0);
+		expect(remote.sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+
+		const automatic = await createHarness({ strategy: "auto" });
+		automatic.faux.nativeCompaction!.setResults([
+			() => {
+				throw createNativeCompactionError("provider_error");
+			},
+		]);
+		automatic.faux.setResponses([fauxAssistantMessage("threshold fallback summary")]);
+
+		await expect(runThresholdCompaction(automatic.session)).resolves.toBe(false);
+
+		expect(automatic.faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(automatic.faux.state.callCount).toBe(1);
+		const fallbackEntry = automatic.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+		expect(fallbackEntry).toMatchObject({
+			type: "compaction",
+			metadata: {
+				reason: "threshold",
+				requestedStrategy: "auto",
+				effectiveStrategy: "local",
+				fallbackCode: "provider_error",
+			},
+		});
+	});
+
+	it("runs post-turn threshold compaction without waiting on its own Session and re-evaluates after failure", async () => {
+		const { session, sessionManager, model, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		session.settingsManager.applyOverrides({
+			compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: model.contextWindow - 1 },
+		});
+		faux.setResponses([fauxAssistantMessage("first complete turn"), fauxAssistantMessage("second complete turn")]);
+		faux.nativeCompaction!.setResults([
+			() => {
+				throw createNativeCompactionError("provider_error");
+			},
+			nativeResult("next-turn-success"),
+		]);
+		const abortSpy = vi.spyOn(session.agent, "abort");
+		const waitForIdleSpy = vi.spyOn(session, "waitForIdle");
+
+		await session.prompt("first threshold trigger");
+
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(0);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({
+				reason: "threshold",
+				errorCode: "provider_error",
+				errorMessage: "Auto-compaction failed: Remote compaction provider request failed.",
+			}),
+		]);
+
+		await session.prompt("second threshold trigger");
+
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(2);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_start")).toHaveLength(2);
+		expect(observed.filter((event) => event.type === "compaction_end")).toHaveLength(2);
+		expect(abortSpy).not.toHaveBeenCalled();
+		expect(waitForIdleSpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps threshold single-flight while one native attempt is pending", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		let release: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		faux.nativeCompaction!.setResults([
+			async (request) => {
+				markStarted?.();
+				await gate;
+				return nativeResult("threshold-single-flight")(request, faux.nativeCompaction!.state);
+			},
+		]);
+
+		const first = runThresholdCompaction(session);
+		await started;
+		await expect(runThresholdCompaction(session)).resolves.toBe(false);
+		release?.();
+		await expect(first).resolves.toBe(false);
+
+		expect(faux.nativeCompaction!.state.compactCallCount).toBe(1);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "remote_compaction")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_start")).toHaveLength(1);
+		expect(observed.filter((event) => event.type === "compaction_end")).toHaveLength(1);
+	});
+
+	it("aborts threshold native compaction without appending a checkpoint", async () => {
+		const { session, sessionManager, faux } = await createHarness({ strategy: "remote" });
+		const observed: AgentSessionEvent[] = [];
+		session.subscribe((event) => observed.push(event));
+		let release: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		faux.nativeCompaction!.setResults([
+			async (request) => {
+				markStarted?.();
+				await gate;
+				return nativeResult("threshold-aborted")(request, faux.nativeCompaction!.state);
+			},
+		]);
+
+		const pending = runThresholdCompaction(session);
+		await started;
+		session.abortCompaction();
+		release?.();
+		await expect(pending).resolves.toBe(false);
+
+		expect(sessionManager.getEntries().some((entry) => entry.type.includes("compaction"))).toBe(false);
+		expect(observed.filter((event) => event.type === "compaction_end")).toEqual([
+			expect.objectContaining({ reason: "threshold", aborted: true, result: undefined }),
+		]);
 	});
 
 	it("uses the configured strategy only for truly optionless manual calls", async () => {

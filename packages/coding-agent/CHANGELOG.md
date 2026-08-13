@@ -8,6 +8,7 @@
 - Added one manual compaction transaction for Local, Remote, and Auto strategies, including safe fallback, idempotent checkpoint commits, abort and branch guards, and sanitized extension events.
 - Added `/compact --local` and experimental `/compact --remote` strategy selection with safe binding metadata in the interactive UI.
 - Added a persistent `local`, `remote`, or `auto` compaction strategy setting with interactive and RPC controls; the default remains Local.
+- Added threshold auto-compaction through the shared Local, Remote, and Auto transaction path, including single-flight, one-shot fallback, ordered queue continuation, and next-turn failure re-evaluation.
 
 ## [0.83.0] - 2026-07-29
 
