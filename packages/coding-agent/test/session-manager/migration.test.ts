@@ -24,8 +24,8 @@ describe("migrateSessionEntries", () => {
 
 		migrateSessionEntries(entries);
 
-		// Header should have version set (v3 is current after hookMessage->custom migration)
-		expect((entries[0] as any).version).toBe(3);
+		// Header should have version set (v4 adds remote compaction entries).
+		expect((entries[0] as any).version).toBe(4);
 
 		// Entries should have id/parentId
 		const msg1 = entries[1] as any;
@@ -38,6 +38,28 @@ describe("migrateSessionEntries", () => {
 		expect(msg2.id).toBeDefined();
 		expect(msg2.id.length).toBe(8);
 		expect(msg2.parentId).toBe(msg1.id);
+	});
+
+	it("migrates v3 to v4 by changing only the header version", () => {
+		const entries: FileEntry[] = [
+			{ type: "session", id: "sess-1", version: 3, timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp" },
+			{
+				type: "compaction",
+				id: "compact-1",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				summary: "unchanged",
+				firstKeptEntryId: "message-1",
+				tokensBefore: 42,
+				details: { marker: "preserve" },
+			},
+		];
+		const businessEntryBefore = JSON.stringify(entries[1]);
+
+		migrateSessionEntries(entries);
+
+		expect(entries[0]).toMatchObject({ type: "session", version: 4 });
+		expect(JSON.stringify(entries[1])).toBe(businessEntryBefore);
 	});
 
 	it("should be idempotent (skip already migrated)", () => {

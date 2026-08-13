@@ -23,7 +23,12 @@ import {
 import { exportFromFile } from "../src/core/export-html/index.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { CompactionSummaryMessage } from "../src/core/messages.ts";
-import type { SessionEntry, SessionTreeNode } from "../src/core/session-manager.ts";
+import {
+	createReadonlySessionManager,
+	type SessionEntry,
+	SessionManager,
+	type SessionTreeNode,
+} from "../src/core/session-manager.ts";
 import { CompactionSummaryMessageComponent } from "../src/modes/interactive/components/compaction-summary-message.ts";
 import { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -33,6 +38,7 @@ const FORBIDDEN_SENTINELS = [
 	"SENTINEL_ENCRYPTED_CONTENT",
 	"SENTINEL_ENDPOINT",
 	"SENTINEL_CREDENTIAL_HASH",
+	"c".repeat(64),
 	"SENTINEL_REQUEST_BODY",
 	"SENTINEL_RESPONSE_BODY",
 	"SENTINEL_PROVIDER_ERROR",
@@ -76,6 +82,52 @@ function createSyntheticRemoteEntry(): Record<string, unknown> {
 		},
 		providerContext: {
 			items: [{ type: "compaction", encrypted_content: "SENTINEL_ENCRYPTED_CONTENT" }],
+		},
+		providerResponse: "SENTINEL_RESPONSE_BODY",
+		providerError: "SENTINEL_PROVIDER_ERROR",
+	};
+}
+
+/** 构造能被 Session v4 Reader 接受的真实 Remote Entry，并在所有私有位置放入 Sentinel。 */
+function createRealRemoteEntry(): Record<string, unknown> {
+	return {
+		type: "remote_compaction",
+		id: "remote-entry-1",
+		parentId: "parent-entry-1",
+		timestamp: "2026-08-13T00:00:00.000Z",
+		operationId: "operation-1",
+		summary: "保留给用户查看的本地摘要",
+		firstKeptEntryId: "remote-entry-1",
+		tokensBefore: 12_345,
+		estimatedTokensAfter: 2_345,
+		usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+		providerContext: {
+			format: "openai-responses-compaction",
+			version: 1,
+			binding: {
+				provider: "openai",
+				api: "openai-responses",
+				model: "gpt-test",
+				endpoint: "https://SENTINEL_ENDPOINT.example/v1/responses/compact",
+				format: "openai-responses-compaction",
+				protocol: "openai-responses-compact",
+				credentialScopeHash: "c".repeat(64),
+			},
+			items: [{ type: "compaction", encrypted_content: "SENTINEL_ENCRYPTED_CONTENT" }],
+		},
+		metadata: {
+			attemptId: "attempt-1",
+			operationId: "operation-1",
+			reason: "overflow",
+			requestedStrategy: "auto",
+			effectiveStrategy: "remote",
+			protocol: "openai-responses-compact",
+			provider: "openai",
+			model: "gpt-test",
+			tokensBefore: 12_345,
+			estimatedTokensAfter: 2_345,
+			requestBody: "SENTINEL_REQUEST_BODY",
+			experimental: true,
 		},
 		providerResponse: "SENTINEL_RESPONSE_BODY",
 		providerError: "SENTINEL_PROVIDER_ERROR",
@@ -200,6 +252,105 @@ describe("压缩 Metadata Privacy Gate", () => {
 		expect(JSON.stringify(extensionEvents)).toContain("保留给用户查看的本地摘要");
 	});
 
+	test("真实 v4 Entry 通过 Parse、Reload、Build、TUI、RPC、Extension 与 HTML 全边界", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-real-remote-privacy-"));
+		temporaryDirectories.push(directory);
+		const sessionPath = join(directory, "session.jsonl");
+		const outputPath = join(directory, "session.html");
+		writeFileSync(
+			sessionPath,
+			`${[
+				JSON.stringify({
+					type: "session",
+					version: 4,
+					id: "real-privacy-session",
+					timestamp: "2026-08-13T00:00:00.000Z",
+					cwd: directory,
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "parent-entry-1",
+					parentId: null,
+					timestamp: "2026-08-13T00:00:01.000Z",
+					message: { role: "user", content: "raw ancestor", timestamp: 1 },
+				}),
+				JSON.stringify(createRealRemoteEntry()),
+				JSON.stringify({
+					type: "message",
+					id: "after-remote",
+					parentId: "remote-entry-1",
+					timestamp: "2026-08-13T00:00:02.000Z",
+					message: { role: "user", content: "after remote", timestamp: 2 },
+				}),
+			].join("\n")}\n`,
+			"utf8",
+		);
+
+		const session = SessionManager.open(sessionPath, directory, directory);
+		const internalContext = session.buildSessionContext();
+		expect(JSON.stringify(internalContext.providerContext)).toContain("SENTINEL_ENCRYPTED_CONTENT");
+		expect(internalContext.messages).toEqual([{ role: "user", content: "after remote", timestamp: 2 }]);
+
+		const rawRemote = session.getEntry("remote-entry-1");
+		expect(rawRemote).toBeDefined();
+		const extensionSessionManager = createReadonlySessionManager(session);
+		const extensionSessionOutputs = [
+			extensionSessionManager.getEntry("remote-entry-1"),
+			extensionSessionManager.getLeafEntry(),
+			extensionSessionManager.getBranch(),
+			extensionSessionManager.buildContextEntries(),
+			extensionSessionManager.getEntries(),
+			extensionSessionManager.getTree(),
+		];
+		const entries = createExternalSessionEntries(session.getEntries());
+		const tree = createExternalSessionTree(session.getTree());
+		const sanitizedEntry = createSanitizedCompactionEntry(rawRemote);
+		const rpcResponses = [
+			{ type: "response", command: "get_entries", success: true, data: { entries, leafId: session.getLeafId() } },
+			{ type: "response", command: "get_tree", success: true, data: { tree, leafId: session.getLeafId() } },
+		];
+		const extensionEvents = [
+			{ type: "session_before_compact", branchEntries: entries },
+			{ type: "session_compact", compactionEntry: sanitizedEntry },
+		];
+
+		const summaryMessage = {
+			role: "compactionSummary",
+			summary: sanitizedEntry.summary,
+			tokensBefore: sanitizedEntry.tokensBefore,
+			timestamp: 1,
+			details: rawRemote,
+		} as CompactionSummaryMessage;
+		const summaryComponent = new CompactionSummaryMessageComponent(summaryMessage);
+		summaryComponent.setExpanded(true);
+		const summaryOutput = summaryComponent.render(100).map(stripVTControlCharacters).join("\n");
+		const selector = new TreeSelectorComponent(
+			session.getTree(),
+			"after-remote",
+			24,
+			() => {},
+			() => {},
+		);
+		const treeOutput = selector.render(100).map(stripVTControlCharacters).join("\n");
+
+		await exportFromFile(sessionPath, { outputPath });
+		const html = readFileSync(outputPath, "utf8");
+		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+		const sessionData = Buffer.from(encoded ?? "", "base64").toString("utf8");
+
+		expectNoForbiddenSentinel(entries);
+		expectNoForbiddenSentinel(extensionSessionOutputs);
+		expectNoForbiddenSentinel(tree);
+		expectNoForbiddenSentinel(rpcResponses);
+		expectNoForbiddenSentinel(extensionEvents);
+		expectNoForbiddenSentinel(summaryOutput);
+		expectNoForbiddenSentinel(treeOutput);
+		expectNoForbiddenSentinel(selector.getTreeList().getSelectedNode());
+		expectNoForbiddenSentinel(sessionData);
+		expect(sessionData).toContain("operation-1");
+		expect(sessionData).toContain("保留给用户查看的本地摘要");
+	});
+
 	test("TUI 摘要组件与 Tree 只渲染安全摘要和 Token 信息", () => {
 		const source = createSyntheticRemoteEntry();
 		const message = {
@@ -242,11 +393,7 @@ describe("压缩 Metadata Privacy Gate", () => {
 			timestamp: "2026-08-13T00:00:00.000Z",
 			cwd: directory,
 		};
-		writeFileSync(
-			sessionPath,
-			`${JSON.stringify(header)}\n${JSON.stringify(createSyntheticRemoteEntry())}\n`,
-			"utf8",
-		);
+		writeFileSync(sessionPath, `${JSON.stringify(header)}\n${JSON.stringify(createRealRemoteEntry())}\n`, "utf8");
 
 		await exportFromFile(sessionPath, { outputPath });
 		const html = readFileSync(outputPath, "utf8");

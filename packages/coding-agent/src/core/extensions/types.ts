@@ -64,7 +64,7 @@ import type { ScopedModel } from "../model-resolver.ts";
 import type {
 	BranchSummaryEntry,
 	CustomEntry,
-	ReadonlySessionManager,
+	ExternalSessionManager,
 	SessionEntry,
 	SessionManager,
 } from "../session-manager.ts";
@@ -319,7 +319,7 @@ export interface ExtensionContext {
 	/** Current working directory */
 	cwd: string;
 	/** Session manager (read-only) */
-	sessionManager: ReadonlySessionManager;
+	sessionManager: ExternalSessionManager;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
 	/** Current model (may be undefined) */

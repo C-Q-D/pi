@@ -41,8 +41,8 @@ export interface PublicCompactionCost {
 	readonly total: number;
 }
 
-/** 可安全公开的压缩 Usage，只保留固定数值字段。 */
-export interface PublicCompactionUsage {
+/** 可安全公开的本地压缩 Usage，只保留固定数值字段。 */
+export interface PublicLocalCompactionUsage {
 	/** 输入 Token 数。 */
 	readonly input: number;
 	/** 输出 Token 数。 */
@@ -60,6 +60,16 @@ export interface PublicCompactionUsage {
 	/** 固定成本明细。 */
 	readonly cost: PublicCompactionCost;
 }
+
+/** 可安全公开的 Provider 原生压缩 Usage。 */
+export interface PublicNativeCompactionUsage {
+	readonly inputTokens: number;
+	readonly outputTokens: number;
+	readonly totalTokens: number;
+}
+
+/** Local 与 Remote 两条链路各自保持原始的闭合公开 Usage 结构。 */
+export type PublicCompactionUsage = PublicLocalCompactionUsage | PublicNativeCompactionUsage;
 
 /** 所有自动展示边界共用的压缩元数据白名单。 */
 export interface CompactionMetadata {
@@ -254,6 +264,20 @@ function readEnum<T extends string>(value: unknown, allowed: ReadonlySet<T>): T 
 
 /** 复制固定 Usage 数值字段；结构不完整时整段省略。 */
 function copyPublicUsage(value: unknown): PublicCompactionUsage | undefined {
+	const inputTokens = readNumber(readOwnDataProperty(value, "inputTokens"));
+	const outputTokens = readNumber(readOwnDataProperty(value, "outputTokens"));
+	const nativeTotalTokens = readNumber(readOwnDataProperty(value, "totalTokens"));
+	if (
+		inputTokens !== undefined &&
+		outputTokens !== undefined &&
+		nativeTotalTokens !== undefined &&
+		Number.isSafeInteger(inputTokens) &&
+		Number.isSafeInteger(outputTokens) &&
+		Number.isSafeInteger(nativeTotalTokens)
+	) {
+		return Object.freeze({ inputTokens, outputTokens, totalTokens: nativeTotalTokens });
+	}
+
 	const input = readNumber(readOwnDataProperty(value, "input"));
 	const output = readNumber(readOwnDataProperty(value, "output"));
 	const cacheRead = readNumber(readOwnDataProperty(value, "cacheRead"));

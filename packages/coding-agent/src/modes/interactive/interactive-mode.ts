@@ -86,7 +86,12 @@ import {
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
-import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
+import {
+	createReadonlySessionManager,
+	type SessionEntry,
+	SessionManager,
+	sessionEntryToContextMessages,
+} from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -1794,6 +1799,7 @@ export class InteractiveMode {
 	private setupExtensionShortcuts(extensionRunner: ExtensionRunner): void {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 		if (shortcuts.size === 0) return;
+		const readonlySessionManager = createReadonlySessionManager(this.sessionManager);
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
@@ -1801,7 +1807,7 @@ export class InteractiveMode {
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),
-			sessionManager: this.sessionManager,
+			sessionManager: readonlySessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),
 			model: this.session.model,
 			scopedModels: this.session.scopedModels,
