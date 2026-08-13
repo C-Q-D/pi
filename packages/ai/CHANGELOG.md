@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added provider-native context binding guards for ordinary streams and compaction, with sanitized mismatch dimensions and portable authenticated request snapshots.
+
 ## [0.83.0] - 2026-07-29
 
 ### Breaking Changes

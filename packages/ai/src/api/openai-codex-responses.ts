@@ -54,6 +54,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import {
 	cloneAndFreezeJson,
+	createNativeCompactionBindingMismatchError,
 	createNativeCompactionError,
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
@@ -895,11 +896,11 @@ export async function compact(
 	try {
 		throwIfNativeCompactionAborted(request.options.signal);
 		const routes = resolveOpenAICodexCompactionRoutes(request.model, request.options);
-		if (
-			routes.primary.endpoint !== request.binding.endpoint ||
-			routes.primary.protocol !== request.binding.protocol
-		) {
-			throw createNativeCompactionError("binding_mismatch");
+		if (routes.primary.endpoint !== request.binding.endpoint) {
+			throw createNativeCompactionBindingMismatchError("endpoint");
+		}
+		if (routes.primary.protocol !== request.binding.protocol) {
+			throw createNativeCompactionBindingMismatchError("protocol");
 		}
 		const prefix = request.providerContext ? validateCodexCanonicalItems(request.providerContext.items) : [];
 		let payload = buildCodexCompactionPayload(request, prefix);

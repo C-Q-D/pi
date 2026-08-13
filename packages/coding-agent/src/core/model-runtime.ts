@@ -1,7 +1,6 @@
 import { dirname, join } from "node:path";
 import {
 	type Api,
-	type ApiStreamOptions,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type AuthCheck,
@@ -13,26 +12,21 @@ import {
 	type CredentialInfo,
 	type CredentialStore,
 	createModels,
-	lazyStream,
 	type Model,
 	type Models,
 	type ModelsApiStreamOptions,
-	ModelsError,
 	type ModelsNativeCompactionOptions,
 	type ModelsNativeCompactionTransforms,
 	type ModelsRefreshOptions,
 	type ModelsRefreshResult,
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
-	type ModelsStreamTransforms,
 	type MutableModels,
 	type NativeCompactionApi,
 	type NativeCompactionResult,
 	type Provider,
 	type ProviderContextEnvelope,
 	type ProviderHeaders,
-	type SimpleStreamOptions,
-	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
@@ -442,34 +436,6 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	private async prepareRequest(
-		model: Model<Api>,
-		options: (StreamOptions & ModelsStreamTransforms) | undefined,
-	): Promise<{ provider: Provider; model: Model<Api>; options: StreamOptions }> {
-		const provider = this.models.getProvider(model.provider);
-		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env });
-		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
-
-		const { transformHeaders, ...providerOptions } = options ?? {};
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
-		const env =
-			resolution.env || providerOptions.env
-				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
-				: undefined;
-		return {
-			provider,
-			model: resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
-			options: {
-				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
-				headers,
-				env,
-			},
-		};
-	}
-
 	/**
 	 * Project configured model headers are resolved after Pi AI has assembled
 	 * effective auth/env, while caller headers and transforms retain final say.
@@ -511,22 +477,25 @@ export class ModelRuntime implements Models {
 		);
 	}
 
+	assertCanConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<void> {
+		return this.models.assertCanConsumeProviderContextWithTransforms(
+			model,
+			providerContext,
+			options,
+			this.nativeCompactionTransforms(),
+		);
+	}
+
 	stream<TApi extends Api>(
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsStreamTransforms) | undefined,
-			);
-			return prepared.provider.stream(
-				prepared.model as Model<TApi>,
-				context,
-				prepared.options as ApiStreamOptions<TApi>,
-			);
-		});
+		return this.models.streamWithTransforms(model, context, options, this.nativeCompactionTransforms());
 	}
 
 	complete<TApi extends Api>(
@@ -538,10 +507,7 @@ export class ModelRuntime implements Models {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
-		});
+		return this.models.streamSimpleWithTransforms(model, context, options, this.nativeCompactionTransforms());
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {

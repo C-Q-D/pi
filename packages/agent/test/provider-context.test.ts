@@ -683,6 +683,53 @@ describe("Agent provider context", () => {
 		expect(streamFn).not.toHaveBeenCalled();
 	});
 
+	it("forwards only defined provider stream options across the Agent boundary", async () => {
+		let receivedOptions: unknown;
+		const streamFn = declaredStream((_model, _context, options) => {
+			receivedOptions = options;
+			return completedStream();
+		});
+		const transformContext = vi.fn(async (messages: AgentMessage[]) => messages);
+		const getApiKey = vi.fn(async () => "dynamic-key");
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			providerContext: providerContext(),
+		};
+		const stream = agentLoop(
+			[{ role: "user", content: "continue", timestamp: 1 }],
+			context,
+			{
+				model: model(),
+				convertToLlm: identityConverter,
+				transformContext,
+				getApiKey,
+				temperature: 0,
+				maxTokens: undefined,
+				sessionId: "session-1",
+				headers: { "x-test": "allowed" },
+			},
+			undefined,
+			streamFn,
+		);
+		for await (const _event of stream) {
+			// Drain the stream so the low-level loop reaches its final state.
+		}
+		await stream.result();
+
+		expect(receivedOptions).toEqual({
+			temperature: 0,
+			apiKey: "dynamic-key",
+			sessionId: "session-1",
+			headers: { "x-test": "allowed" },
+		});
+		expect(receivedOptions).not.toHaveProperty("model");
+		expect(receivedOptions).not.toHaveProperty("convertToLlm");
+		expect(receivedOptions).not.toHaveProperty("transformContext");
+		expect(receivedOptions).not.toHaveProperty("getApiKey");
+		expect(receivedOptions).not.toHaveProperty("maxTokens");
+	});
+
 	it("opens a new error turn when prepareNextTurn validation fails after a completed turn", async () => {
 		const streamFn = declaredStream(vi.fn(() => completedStream()));
 		const userMessage: AgentMessage = { role: "user", content: "run", timestamp: 1 };

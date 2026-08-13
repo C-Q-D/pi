@@ -9,6 +9,7 @@ import type {
 } from "../types.ts";
 import { lazyStream } from "../utils/lazy-stream.ts";
 import {
+	createNativeCompactionBindingMismatchError,
 	createNativeCompactionError,
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
@@ -46,17 +47,21 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw createNativeCompactionError("aborted");
 }
 
-function routesMatchRequest(routes: NativeCompactionRouteSet, request: NativeCompactionProviderRequest): boolean {
+function assertRoutesMatchRequest(routes: NativeCompactionRouteSet, request: NativeCompactionProviderRequest): void {
 	const authorizedBindings = getAuthorizedNativeCompactionBindings(request);
 	const resolvedRoutes = [routes.primary, ...routes.fallbacks];
-	return (
-		resolvedRoutes.length === authorizedBindings.length &&
-		resolvedRoutes.every(
-			(route, index) =>
-				route.endpoint === authorizedBindings[index]?.endpoint &&
-				route.protocol === authorizedBindings[index]?.protocol,
-		)
-	);
+	if (resolvedRoutes.length !== authorizedBindings.length) {
+		throw createNativeCompactionBindingMismatchError("endpoint");
+	}
+	for (const [index, route] of resolvedRoutes.entries()) {
+		const authorized = authorizedBindings[index]!;
+		if (route.endpoint !== authorized.endpoint) {
+			throw createNativeCompactionBindingMismatchError("endpoint");
+		}
+		if (route.protocol !== authorized.protocol) {
+			throw createNativeCompactionBindingMismatchError("protocol");
+		}
+	}
 }
 
 async function loadNativeStreams(
@@ -84,7 +89,7 @@ async function loadNativeStreams(
 		throw sanitizeNativeCompactionError(error, "provider_error");
 	}
 	throwIfAborted(request.options.signal);
-	if (!routesMatchRequest(routes, request)) throw createNativeCompactionError("binding_mismatch");
+	assertRoutesMatchRequest(routes, request);
 	return streams;
 }
 

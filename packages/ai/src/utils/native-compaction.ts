@@ -8,6 +8,7 @@
 import type {
 	JsonObject,
 	JsonValue,
+	NativeCompactionBindingMismatchDimension,
 	NativeCompactionErrorCode,
 	NativeCompactionProtocol,
 	NativeCompactionResult,
@@ -28,6 +29,15 @@ const NATIVE_COMPACTION_PROTOCOLS = new Set<NativeCompactionProtocol>([
 ]);
 
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const NATIVE_COMPACTION_BINDING_DIMENSIONS = new Set<NativeCompactionBindingMismatchDimension>([
+	"provider",
+	"api",
+	"model",
+	"endpoint",
+	"format",
+	"protocol",
+	"credential",
+]);
 
 const NATIVE_COMPACTION_ERROR_MESSAGES = {
 	unsupported: "Native compaction is not supported.",
@@ -40,7 +50,12 @@ const NATIVE_COMPACTION_ERROR_MESSAGES = {
 } as const satisfies Record<NativeCompactionErrorCode, string>;
 
 const VALIDATION_FAILURE_CODES = new WeakMap<object, NativeCompactionErrorCode>();
-const NATIVE_COMPACTION_ERROR_CODES = new WeakMap<object, NativeCompactionErrorCode>();
+export interface NativeCompactionErrorMetadata {
+	readonly code: NativeCompactionErrorCode;
+	readonly bindingDimension?: NativeCompactionBindingMismatchDimension;
+}
+
+const NATIVE_COMPACTION_ERRORS = new WeakMap<object, NativeCompactionErrorMetadata>();
 
 /** 仅在模块内部流转、不会暴露原异常内容的校验失败。 */
 class NativeCompactionValidationFailure extends Error {
@@ -54,12 +69,27 @@ class NativeCompactionValidationFailure extends Error {
 export class NativeCompactionError extends Error {
 	/** 可供上层稳定分支处理的安全错误码。 */
 	readonly code: NativeCompactionErrorCode;
+	/** Binding 错误唯一允许公开的维度，不包含实际身份值。 */
+	readonly bindingDimension?: NativeCompactionBindingMismatchDimension;
 
-	constructor(code: NativeCompactionErrorCode) {
+	constructor(code: NativeCompactionErrorCode, bindingDimension?: NativeCompactionBindingMismatchDimension) {
 		super(NATIVE_COMPACTION_ERROR_MESSAGES[code]);
 		this.name = "NativeCompactionError";
 		this.code = code;
-		NATIVE_COMPACTION_ERROR_CODES.set(this, code);
+		if (
+			code === "binding_mismatch" &&
+			bindingDimension !== undefined &&
+			NATIVE_COMPACTION_BINDING_DIMENSIONS.has(bindingDimension)
+		) {
+			this.bindingDimension = bindingDimension;
+		}
+		NATIVE_COMPACTION_ERRORS.set(
+			this,
+			Object.freeze({
+				code,
+				...(this.bindingDimension === undefined ? {} : { bindingDimension: this.bindingDimension }),
+			}),
+		);
 		Object.freeze(this);
 	}
 }
@@ -69,14 +99,30 @@ export function createNativeCompactionError(code: NativeCompactionErrorCode): Na
 	return new NativeCompactionError(code);
 }
 
+/** 创建只公开安全维度标识的 Binding 不匹配错误。 */
+export function createNativeCompactionBindingMismatchError(
+	bindingDimension: NativeCompactionBindingMismatchDimension,
+): NativeCompactionError {
+	return new NativeCompactionError("binding_mismatch", bindingDimension);
+}
+
+/** 读取本模块登记的固定安全错误元数据；同形外部对象不会被信任。 */
+export function getNativeCompactionErrorMetadata(error: unknown): NativeCompactionErrorMetadata | undefined {
+	const isObject = (typeof error === "object" && error !== null) || typeof error === "function";
+	return isObject ? NATIVE_COMPACTION_ERRORS.get(error) : undefined;
+}
+
 /** 保留本模块产生的固定错误码，并把其他异常替换为指定安全错误。 */
 export function sanitizeNativeCompactionError(
 	error: unknown,
 	fallbackCode: NativeCompactionErrorCode,
 ): NativeCompactionError {
 	const isObject = (typeof error === "object" && error !== null) || typeof error === "function";
-	const code = (isObject ? NATIVE_COMPACTION_ERROR_CODES.get(error) : undefined) ?? fallbackCode;
-	return createNativeCompactionError(code);
+	const metadata = isObject ? NATIVE_COMPACTION_ERRORS.get(error) : undefined;
+	if (metadata?.code === "binding_mismatch" && metadata.bindingDimension !== undefined) {
+		return createNativeCompactionBindingMismatchError(metadata.bindingDimension);
+	}
+	return createNativeCompactionError(metadata?.code ?? fallbackCode);
 }
 
 /** 把未知异常统一替换为指定安全错误，不复制原异常文本。 */

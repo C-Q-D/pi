@@ -643,6 +643,16 @@ export interface NativeCompactionResult {
 	readonly usage?: NativeCompactionUsage;
 }
 
+/** Binding 不匹配时唯一允许公开的安全维度标识。 */
+export type NativeCompactionBindingMismatchDimension =
+	| "provider"
+	| "api"
+	| "model"
+	| "endpoint"
+	| "format"
+	| "protocol"
+	| "credential";
+
 /** Provider 原生压缩对外公开的固定安全错误码。 */
 export type NativeCompactionErrorCode =
 	| "unsupported"

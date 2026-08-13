@@ -1,5 +1,11 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	declareStreamFnHandlesProviderContext,
+	setDefaultStreamFn,
+	type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -186,7 +192,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
+	const hasExistingSession = existingSession.messages.length > 0 || existingSession.providerContext !== undefined;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
 	let model = options.model;
@@ -297,9 +303,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model,
 			thinkingLevel,
 			tools: [],
+			...(existingSession.providerContext === undefined ? {} : { providerContext: existingSession.providerContext }),
 		},
 		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
+		streamFn: declareStreamFnHandlesProviderContext(async (model, context, options) => {
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -327,7 +334,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: (headers ?? {});
 				},
 			});
-		},
+		}),
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
@@ -361,7 +368,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Restore messages if session has existing data
 	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
+		agent.replaceContext({
+			messages: existingSession.messages,
+			...(existingSession.providerContext === undefined ? {} : { providerContext: existingSession.providerContext }),
+		});
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}

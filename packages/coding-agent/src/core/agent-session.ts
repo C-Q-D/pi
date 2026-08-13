@@ -24,7 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, createNativeCompactionError, type NativeCompactionApi } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -1587,26 +1587,37 @@ export class AgentSession {
 		});
 	}
 
+	private async _assertModelCanConsumeProviderContext(model: Model<any>): Promise<void> {
+		const providerContext = this.agent.state.providerContext;
+		if (providerContext === undefined) return;
+		if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") {
+			throw createNativeCompactionError("unsupported");
+		}
+		await this._modelRuntime.assertCanConsumeProviderContext(model as Model<NativeCompactionApi>, providerContext);
+	}
+
 	/**
 	 * Set model directly.
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		const targetModel = structuredClone(model);
+		if (!(await this._modelRuntime.checkAuth(targetModel.provider))) {
+			throw new Error(`No API key for ${targetModel.provider}/${targetModel.id}`);
 		}
+		await this._assertModelCanConsumeProviderContext(targetModel);
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		this.agent.state.model = targetModel;
+		this.sessionManager.appendModelChange(targetModel.provider, targetModel.id);
+		this.settingsManager.setDefaultModelAndProvider(targetModel.provider, targetModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
 
-		await this._emitModelSelect(model, previousModel, "set");
+		await this._emitModelSelect(targetModel, previousModel, "set");
 	}
 
 	/**
@@ -1623,8 +1634,12 @@ export class AgentSession {
 	}
 
 	private async _cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
+		const scopedModelSnapshots = this._scopedModels.map((scoped) => ({
+			model: structuredClone(scoped.model),
+			thinkingLevel: scoped.thinkingLevel,
+		}));
 		const checks = await Promise.all(
-			this._scopedModels.map(async (scoped) => ({
+			scopedModelSnapshots.map(async (scoped) => ({
 				scoped,
 				auth: await this._modelRuntime.checkAuth(scoped.model.provider),
 			})),
@@ -1639,12 +1654,14 @@ export class AgentSession {
 		const len = scopedModels.length;
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
+		const targetModel = next.model;
+		await this._assertModelCanConsumeProviderContext(targetModel);
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 
 		// Apply model
-		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		this.agent.state.model = targetModel;
+		this.sessionManager.appendModelChange(targetModel.provider, targetModel.id);
+		this.settingsManager.setDefaultModelAndProvider(targetModel.provider, targetModel.id);
 
 		// Apply thinking level.
 		// - Explicit scoped model thinking level overrides current session level
@@ -1652,9 +1669,9 @@ export class AgentSession {
 		// setThinkingLevel clamps to model capabilities.
 		this.setThinkingLevel(thinkingLevel);
 
-		await this._emitModelSelect(next.model, currentModel, "cycle");
+		await this._emitModelSelect(targetModel, currentModel, "cycle");
 
-		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
+		return { model: targetModel, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
 
 	private async _cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
@@ -1667,19 +1684,20 @@ export class AgentSession {
 		if (currentIndex === -1) currentIndex = 0;
 		const len = availableModels.length;
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
-		const nextModel = availableModels[nextIndex];
+		const targetModel = structuredClone(availableModels[nextIndex]);
+		await this._assertModelCanConsumeProviderContext(targetModel);
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
-		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		this.agent.state.model = targetModel;
+		this.sessionManager.appendModelChange(targetModel.provider, targetModel.id);
+		this.settingsManager.setDefaultModelAndProvider(targetModel.provider, targetModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
 
-		await this._emitModelSelect(nextModel, currentModel, "cycle");
+		await this._emitModelSelect(targetModel, currentModel, "cycle");
 
-		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
+		return { model: targetModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
 
 	// =========================================================================

@@ -2,6 +2,7 @@ import type { Context, JsonValue, Message, Tool } from "../types.ts";
 import { createNativeCompactionError, sanitizeNativeCompactionError } from "./native-compaction.ts";
 
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const TYPEBOX_INTERNAL_KEYS = new Set(["~kind", "~optional", "~readonly"]);
 
 function cloneData(value: unknown, active: WeakSet<object>, allowTypeBoxKind = false): JsonValue {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
@@ -45,7 +46,13 @@ function cloneData(value: unknown, active: WeakSet<object>, allowTypeBoxKind = f
 				throw createNativeCompactionError("invalid_context");
 			}
 			const descriptor = Object.getOwnPropertyDescriptor(value, key);
-			if (allowTypeBoxKind && key === "~kind" && descriptor && !descriptor.enumerable && "value" in descriptor) {
+			if (
+				allowTypeBoxKind &&
+				TYPEBOX_INTERNAL_KEYS.has(key) &&
+				descriptor &&
+				!descriptor.enumerable &&
+				"value" in descriptor
+			) {
 				continue;
 			}
 			if (!descriptor?.enumerable || !("value" in descriptor)) {
@@ -333,7 +340,11 @@ function cloneMessage(value: unknown): Message {
 }
 
 function cloneTool(value: unknown): Tool {
-	const properties = readProjectedObject(value, new Set(["name", "description", "parameters", "constrainedSampling"]));
+	const properties = readProjectedObject(
+		value,
+		new Set(["name", "description", "parameters", "constrainedSampling"]),
+		new Set(["label", "prepareArguments", "executionMode", "execute"]),
+	);
 	if (!properties.has("name") || !properties.has("description") || !properties.has("parameters")) {
 		throw createNativeCompactionError("invalid_context");
 	}
@@ -347,8 +358,9 @@ function cloneTool(value: unknown): Tool {
 	const clone: Record<string, JsonValue> = {};
 	for (const [key, entry] of properties) {
 		if (key === "parameters") clone.parameters = parameters;
-		else if (key === "constrainedSampling") clone.constrainedSampling = cloneConstrainedSampling(entry);
-		else clone[key] = cloneData(entry, new WeakSet());
+		else if (key === "constrainedSampling") {
+			if (entry !== undefined) clone.constrainedSampling = cloneConstrainedSampling(entry);
+		} else clone[key] = cloneData(entry, new WeakSet());
 	}
 	return Object.freeze(clone) as unknown as Tool;
 }

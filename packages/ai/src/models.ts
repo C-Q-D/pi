@@ -49,6 +49,7 @@ import { lazyStream } from "./utils/lazy-stream.ts";
 import {
 	cloneAndFreezeJson,
 	cloneAndFreezeProviderContext,
+	createNativeCompactionBindingMismatchError,
 	createNativeCompactionError,
 	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
@@ -58,7 +59,7 @@ import { validateNativeCompactionRouteSet } from "./utils/native-endpoint.ts";
 import {
 	assertAuthorizedNativeCompactionBinding,
 	assertNativeCompactionProviderRequest,
-	nativeCompactionBindingIsAuthorized,
+	getNativeCompactionBindingMismatchDimension,
 	registerNativeCompactionProviderRequest,
 } from "./utils/native-request.ts";
 
@@ -191,6 +192,7 @@ export interface Models {
 	/** Optional on read-only wrappers; createModels() always returns the complete capability. */
 	readonly compact?: NativeCompactionModels["compact"];
 	readonly canConsumeProviderContext?: NativeCompactionModels["canConsumeProviderContext"];
+	readonly assertCanConsumeProviderContext?: NativeCompactionModels["assertCanConsumeProviderContext"];
 
 	getProviders(): readonly Provider[];
 	getProvider(id: string): Provider | undefined;
@@ -266,6 +268,13 @@ export interface NativeCompactionModels {
 		providerContext: ProviderContextEnvelope,
 		options?: ModelsNativeCompactionOptions<TApi>,
 	): Promise<boolean>;
+
+	/** Reject unless the effective request can safely consume this exact provider context. */
+	assertCanConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<void>;
 }
 
 export type MutableModels = Models &
@@ -286,6 +295,24 @@ export type MutableModels = Models &
 			options: ModelsNativeCompactionOptions<TApi> | undefined,
 			transforms: ModelsNativeCompactionTransforms,
 		): Promise<boolean>;
+		assertCanConsumeProviderContextWithTransforms<TApi extends NativeCompactionApi>(
+			model: Model<TApi>,
+			providerContext: ProviderContextEnvelope,
+			options: ModelsNativeCompactionOptions<TApi> | undefined,
+			transforms: ModelsNativeCompactionTransforms,
+		): Promise<void>;
+		streamWithTransforms<TApi extends Api>(
+			model: Model<TApi>,
+			context: Context,
+			options: ModelsApiStreamOptions<TApi> | undefined,
+			transforms: ModelsNativeCompactionTransforms,
+		): AssistantMessageEventStream;
+		streamSimpleWithTransforms(
+			model: Model<Api>,
+			context: Context,
+			options: ModelsSimpleStreamOptions | undefined,
+			transforms: ModelsNativeCompactionTransforms,
+		): AssistantMessageEventStream;
 	};
 
 export interface CreateModelsOptions {
@@ -1089,7 +1116,7 @@ class ModelsImpl implements MutableModels {
 			inputKind === "native"
 				? (validateModelsNativeCompactionOptions(inputModelSnapshot.api, rawOptionProperties) as StreamOptions &
 						ModelsStreamTransforms)
-				: cloneStreamOptionsForNative(options);
+				: cloneStreamOptionsForNative(options, true);
 		const rawNativeOptions = selectNativeCompactionOptions(inputModelSnapshot.api, rawStreamOptions);
 		if (inputModelSnapshot.api === "openai-codex-responses" && rawOptionProperties.has("apiKey")) {
 			throw createNativeCompactionError("unsupported");
@@ -1168,8 +1195,14 @@ class ModelsImpl implements MutableModels {
 					}).binding,
 			),
 		);
-		if (providerContext && !nativeCompactionBindingIsAuthorized(providerContext.binding, authorizedBindings)) {
-			throw createNativeCompactionError("binding_mismatch");
+		if (providerContext) {
+			const mismatchDimension = getNativeCompactionBindingMismatchDimension(
+				providerContext.binding,
+				authorizedBindings,
+			);
+			if (mismatchDimension !== undefined) {
+				throw createNativeCompactionBindingMismatchError(mismatchDimension);
+			}
 		}
 
 		const request = Object.freeze({
@@ -1227,6 +1260,28 @@ class ModelsImpl implements MutableModels {
 		return this.canConsumeProviderContextWithTransforms(model, providerContext, options, {});
 	}
 
+	async assertCanConsumeProviderContext<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options?: ModelsNativeCompactionOptions<TApi>,
+	): Promise<void> {
+		return this.assertCanConsumeProviderContextWithTransforms(model, providerContext, options, {});
+	}
+
+	private async providerCanConsumeProviderContext<TApi extends NativeCompactionApi>(
+		preflight: NativeCompactionPreflight<TApi>,
+	): Promise<boolean> {
+		try {
+			const result: unknown = await preflight.provider.canConsumeProviderContext(preflight.request);
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			if (typeof result !== "boolean") throw createNativeCompactionError("protocol");
+			return result;
+		} catch (error) {
+			throwIfNativeCompactionAborted(preflight.request.options.signal);
+			throw sanitizeNativeCompactionError(error, "provider_error");
+		}
+	}
+
 	async canConsumeProviderContextWithTransforms<TApi extends NativeCompactionApi>(
 		model: Model<TApi>,
 		providerContext: ProviderContextEnvelope,
@@ -1240,14 +1295,24 @@ class ModelsImpl implements MutableModels {
 			"native",
 			transforms,
 		);
-		try {
-			const result: unknown = await preflight.provider.canConsumeProviderContext(preflight.request);
-			throwIfNativeCompactionAborted(preflight.request.options.signal);
-			if (typeof result !== "boolean") throw createNativeCompactionError("protocol");
-			return result;
-		} catch (error) {
-			throwIfNativeCompactionAborted(preflight.request.options.signal);
-			throw sanitizeNativeCompactionError(error, "provider_error");
+		return this.providerCanConsumeProviderContext(preflight);
+	}
+
+	async assertCanConsumeProviderContextWithTransforms<TApi extends NativeCompactionApi>(
+		model: Model<TApi>,
+		providerContext: ProviderContextEnvelope,
+		options: ModelsNativeCompactionOptions<TApi> | undefined,
+		transforms: ModelsNativeCompactionTransforms,
+	): Promise<void> {
+		const preflight = await this.nativeCompactionPreflight(
+			model,
+			{ messages: [], providerContext },
+			options,
+			"native",
+			transforms,
+		);
+		if (!(await this.providerCanConsumeProviderContext(preflight))) {
+			throw createNativeCompactionError("unsupported");
 		}
 	}
 
@@ -1255,6 +1320,15 @@ class ModelsImpl implements MutableModels {
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
+	): AssistantMessageEventStream {
+		return this.streamWithTransforms(model, context, options, {});
+	}
+
+	streamWithTransforms<TApi extends Api>(
+		model: Model<TApi>,
+		context: Context,
+		options: ModelsApiStreamOptions<TApi> | undefined,
+		transforms: ModelsNativeCompactionTransforms,
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
 			const rawProviderContext = readContextProviderContext(context);
@@ -1264,17 +1338,11 @@ class ModelsImpl implements MutableModels {
 					context,
 					options,
 					"stream",
+					transforms,
 				);
-				let canConsume: unknown;
-				try {
-					canConsume = await preflight.provider.canConsumeProviderContext(preflight.request);
-				} catch (error) {
-					throwIfNativeCompactionAborted(preflight.request.options.signal);
-					throw sanitizeNativeCompactionError(error, "provider_error");
+				if (!(await this.providerCanConsumeProviderContext(preflight))) {
+					throw createNativeCompactionError("unsupported");
 				}
-				throwIfNativeCompactionAborted(preflight.request.options.signal);
-				if (typeof canConsume !== "boolean") throw createNativeCompactionError("protocol");
-				if (!canConsume) throw createNativeCompactionError("unsupported");
 				try {
 					const stream = preflight.provider.stream(
 						preflight.request.model,
@@ -1292,6 +1360,7 @@ class ModelsImpl implements MutableModels {
 			const { requestModel, requestOptions } = await this.applyAuth(
 				model,
 				options as ModelsApiStreamOptions<Api> | undefined,
+				transforms,
 			);
 			return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
 		});
@@ -1306,6 +1375,15 @@ class ModelsImpl implements MutableModels {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		return this.streamSimpleWithTransforms(model, context, options, {});
+	}
+
+	streamSimpleWithTransforms(
+		model: Model<Api>,
+		context: Context,
+		options: ModelsSimpleStreamOptions | undefined,
+		transforms: ModelsNativeCompactionTransforms,
+	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
 			const rawProviderContext = readContextProviderContext(context);
 			if (rawProviderContext !== undefined) {
@@ -1315,17 +1393,11 @@ class ModelsImpl implements MutableModels {
 					context,
 					options,
 					"stream",
+					transforms,
 				);
-				let canConsume: unknown;
-				try {
-					canConsume = await preflight.provider.canConsumeProviderContext(preflight.request);
-				} catch (error) {
-					throwIfNativeCompactionAborted(preflight.request.options.signal);
-					throw sanitizeNativeCompactionError(error, "provider_error");
+				if (!(await this.providerCanConsumeProviderContext(preflight))) {
+					throw createNativeCompactionError("unsupported");
 				}
-				throwIfNativeCompactionAborted(preflight.request.options.signal);
-				if (typeof canConsume !== "boolean") throw createNativeCompactionError("protocol");
-				if (!canConsume) throw createNativeCompactionError("unsupported");
 				try {
 					const stream = preflight.provider.streamSimple(
 						preflight.request.model,
@@ -1340,7 +1412,7 @@ class ModelsImpl implements MutableModels {
 				}
 			}
 			const provider = this.requireProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
+			const { requestModel, requestOptions } = await this.applyAuth(model, options, transforms);
 			return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
 		});
 	}

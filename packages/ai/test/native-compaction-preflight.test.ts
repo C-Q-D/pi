@@ -191,6 +191,7 @@ describe("Models native compaction preflight", () => {
 		expectTypeOf(models.compact).toMatchTypeOf<Models["compact"]>();
 		expect(typeof models.compact).toBe("function");
 		expect(typeof models.canConsumeProviderContext).toBe("function");
+		expect(typeof models.assertCanConsumeProviderContext).toBe("function");
 	});
 
 	it("reads the OpenAI Codex stable subject only through its provider-owned callback", async () => {

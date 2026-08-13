@@ -1,7 +1,13 @@
 import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model, type Usage } from "@earendil-works/pi-ai";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	type Model,
+	NativeCompactionError,
+	type Usage,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
@@ -112,6 +118,117 @@ describe("AgentSession model and extension characterization", () => {
 			`No API key for ${harness.getModel().provider}/faux-2`,
 		);
 	});
+
+	it("does not mutate model, thinking level, settings, or session when Binding Guard rejects set and cycle", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: false },
+			],
+		});
+		harnesses.push(harness);
+		const modelOne = harness.getModel("faux-1")!;
+		const modelTwo = harness.getModel("faux-2")!;
+		modelOne.api = "openai-responses";
+		modelTwo.api = "openai-responses";
+		harness.session.setScopedModels([{ model: modelOne }, { model: modelTwo }]);
+		harness.session.setThinkingLevel("high");
+		harness.session.agent.replaceContext({
+			messages: harness.session.messages,
+			providerContext: {
+				format: "openai-responses-compaction",
+				version: 1,
+				binding: {
+					provider: modelOne.provider,
+					api: "openai-responses",
+					model: modelOne.id,
+					endpoint: "https://binding.example.test/v1/compact",
+					format: "openai-responses-compaction",
+					protocol: "openai-responses-compact",
+					credentialScopeHash: "a".repeat(64),
+				},
+				items: [{ type: "compaction", encrypted_content: "opaque" }],
+			},
+		});
+		const guard = vi
+			.spyOn(harness.session.modelRuntime, "assertCanConsumeProviderContext")
+			.mockRejectedValue(new NativeCompactionError("binding_mismatch"));
+		const entriesBefore = harness.sessionManager.getEntries();
+		const defaultProviderBefore = harness.settingsManager.getDefaultProvider();
+		const defaultModelBefore = harness.settingsManager.getDefaultModel();
+
+		await expect(harness.session.setModel(modelTwo)).rejects.toMatchObject({ code: "binding_mismatch" });
+		await expect(harness.session.cycleModel()).rejects.toMatchObject({ code: "binding_mismatch" });
+
+		expect(guard).toHaveBeenCalledTimes(2);
+		expect(harness.session.model).toBe(modelOne);
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.settingsManager.getDefaultProvider()).toBe(defaultProviderBefore);
+		expect(harness.settingsManager.getDefaultModel()).toBe(defaultModelBefore);
+		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
+	});
+
+	it.each(["set", "cycle"] as const)(
+		"commits the exact model snapshot checked by the Binding Guard for %s",
+		async (mode) => {
+			const harness = await createHarness({
+				models: [
+					{ id: "faux-1", name: "One", reasoning: true },
+					{ id: "faux-2", name: "Two", reasoning: false },
+				],
+			});
+			harnesses.push(harness);
+			const modelOne = harness.getModel("faux-1")!;
+			const modelTwo = harness.getModel("faux-2")!;
+			modelOne.api = "openai-responses";
+			modelTwo.api = "openai-responses";
+			harness.session.setScopedModels([{ model: modelOne }, { model: modelTwo }]);
+			harness.session.agent.replaceContext({
+				messages: harness.session.messages,
+				providerContext: {
+					format: "openai-responses-compaction",
+					version: 1,
+					binding: {
+						provider: modelOne.provider,
+						api: "openai-responses",
+						model: modelOne.id,
+						endpoint: "https://binding.example.test/v1/compact",
+						format: "openai-responses-compaction",
+						protocol: "openai-responses-compact",
+						credentialScopeHash: "a".repeat(64),
+					},
+					items: [{ type: "compaction", encrypted_content: "opaque" }],
+				},
+			});
+			let releaseGuard = () => {};
+			const guardMayFinish = new Promise<void>((resolve) => {
+				releaseGuard = resolve;
+			});
+			let guardStarted = () => {};
+			const guardDidStart = new Promise<void>((resolve) => {
+				guardStarted = resolve;
+			});
+			let checkedModel: Model<string> | undefined;
+			vi.spyOn(harness.session.modelRuntime, "assertCanConsumeProviderContext").mockImplementation(async (model) => {
+				checkedModel = model;
+				guardStarted();
+				await guardMayFinish;
+			});
+
+			const pending = mode === "set" ? harness.session.setModel(modelTwo) : harness.session.cycleModel();
+			await guardDidStart;
+			modelTwo.id = "mutated-after-guard";
+			modelTwo.baseUrl = "https://mutated.example.test";
+			releaseGuard();
+			await pending;
+
+			expect(checkedModel).toMatchObject({ id: "faux-2", baseUrl: expect.not.stringContaining("mutated") });
+			expect(harness.session.model).toMatchObject({ id: "faux-2", baseUrl: expect.not.stringContaining("mutated") });
+			expect(harness.session.model).toBe(checkedModel);
+			expect(harness.settingsManager.getDefaultModel()).toBe("faux-2");
+			expect(harness.sessionManager.getBranch().at(-1)).toMatchObject({ type: "model_change", modelId: "faux-2" });
+		},
+	);
 
 	it("allows extension tool_call handlers to block tool execution", async () => {
 		const echoTool: AgentTool = {

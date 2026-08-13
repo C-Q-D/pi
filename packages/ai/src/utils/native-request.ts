@@ -1,18 +1,38 @@
-import type { NativeCompactionProviderRequest, ProviderContextBinding } from "../types.ts";
-import { createNativeCompactionError } from "./native-compaction.ts";
+import type {
+	NativeCompactionBindingMismatchDimension,
+	NativeCompactionProviderRequest,
+	ProviderContextBinding,
+} from "../types.ts";
+import { createNativeCompactionBindingMismatchError, createNativeCompactionError } from "./native-compaction.ts";
 
 const AUTHORIZED_NATIVE_COMPACTION_BINDINGS = new WeakMap<object, readonly ProviderContextBinding[]>();
 
-function bindingsMatch(left: ProviderContextBinding, right: ProviderContextBinding): boolean {
-	return (
-		left.provider === right.provider &&
-		left.api === right.api &&
-		left.model === right.model &&
-		left.endpoint === right.endpoint &&
-		left.format === right.format &&
-		left.protocol === right.protocol &&
-		left.credentialScopeHash === right.credentialScopeHash
-	);
+const BINDING_DIMENSIONS: readonly {
+	readonly dimension: NativeCompactionBindingMismatchDimension;
+	readonly read: (binding: ProviderContextBinding) => string;
+}[] = [
+	{ dimension: "provider", read: (binding) => binding.provider },
+	{ dimension: "api", read: (binding) => binding.api },
+	{ dimension: "model", read: (binding) => binding.model },
+	{ dimension: "endpoint", read: (binding) => binding.endpoint },
+	{ dimension: "format", read: (binding) => binding.format },
+	{ dimension: "protocol", read: (binding) => binding.protocol },
+	{ dimension: "credential", read: (binding) => binding.credentialScopeHash },
+];
+
+/** 返回与预授权 Route Set 首个不一致的安全维度；完全匹配时返回 undefined。 */
+export function getNativeCompactionBindingMismatchDimension(
+	binding: ProviderContextBinding,
+	authorizedBindings: readonly ProviderContextBinding[],
+): NativeCompactionBindingMismatchDimension | undefined {
+	let candidates = authorizedBindings;
+	for (const { dimension, read } of BINDING_DIMENSIONS) {
+		const value = read(binding);
+		const matching = candidates.filter((candidate) => read(candidate) === value);
+		if (matching.length === 0) return dimension;
+		candidates = matching;
+	}
+	return undefined;
 }
 
 /** 仅供 Models Preflight 登记已冻结请求及其预授权 Binding 集合。 */
@@ -45,9 +65,11 @@ export function assertAuthorizedNativeCompactionBinding(
 	request: NativeCompactionProviderRequest,
 	binding: ProviderContextBinding,
 ): void {
-	if (!getAuthorizedNativeCompactionBindings(request).some((authorized) => bindingsMatch(binding, authorized))) {
-		throw createNativeCompactionError("binding_mismatch");
-	}
+	const dimension = getNativeCompactionBindingMismatchDimension(
+		binding,
+		getAuthorizedNativeCompactionBindings(request),
+	);
+	if (dimension !== undefined) throw createNativeCompactionBindingMismatchError(dimension);
 }
 
 /** 使用同一 Exact Match 规则检查尚未登记请求的输入 Binding。 */
@@ -55,5 +77,5 @@ export function nativeCompactionBindingIsAuthorized(
 	binding: ProviderContextBinding,
 	authorizedBindings: readonly ProviderContextBinding[],
 ): boolean {
-	return authorizedBindings.some((authorized) => bindingsMatch(binding, authorized));
+	return getNativeCompactionBindingMismatchDimension(binding, authorizedBindings) === undefined;
 }

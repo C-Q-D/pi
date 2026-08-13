@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed provider-context stream dispatch to forward only defined provider options and preserve sanitized native-compaction diagnostics.
+
 ## [0.83.0] - 2026-07-29
 
 ## [0.82.1] - 2026-07-25

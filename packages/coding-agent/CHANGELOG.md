@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added exact provider-context binding checks for model switching and restored sessions, plus a provider-independent local recovery primitive for remote checkpoints.
+
 ## [0.83.0] - 2026-07-29
 
 ### New Features

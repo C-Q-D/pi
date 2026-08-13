@@ -4,14 +4,17 @@ import { join } from "node:path";
 import {
 	createModels,
 	createProvider,
+	fauxAssistantMessage,
 	fauxProvider,
 	InMemoryCredentialStore,
 	type Model,
+	type NativeCompactionBindingMismatchDimension,
 	NativeCompactionError,
 	type NativeCompactionProviderRequest,
 	type NativeCompactionResult,
 	type OAuthAuth,
 	type ProviderContextBinding,
+	type ProviderContextEnvelope,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
@@ -139,6 +142,72 @@ describe("ModelRuntime native compaction", () => {
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("uses the same exact Binding Guard for assertion and ordinary stream before provider dispatch", async () => {
+		const faux = fauxProvider({ provider: "runtime-binding", nativeCompaction: {} });
+		const runtime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory(),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		runtime.registerNativeProvider(faux.provider);
+		const model = runtime.getModel("runtime-binding", "faux-1") as Model<"openai-responses">;
+		faux.nativeCompaction!.setResults([(request) => compactedResult(request.binding)]);
+		const compacted = await runtime.compact(model, { messages: [] });
+
+		await runtime.assertCanConsumeProviderContext(model, compacted.providerContext);
+		faux.setResponses([fauxAssistantMessage("same binding")]);
+		const sameBinding = await runtime
+			.streamSimple(model, { messages: [], providerContext: compacted.providerContext })
+			.result();
+		expect(sameBinding.stopReason).toBe("stop");
+		expect(faux.nativeCompaction!.state.consumerCallCount).toBe(2);
+		expect(faux.state.callCount).toBe(1);
+
+		const binding = compacted.providerContext.binding;
+		const mismatches: Array<[NativeCompactionBindingMismatchDimension, ProviderContextEnvelope]> = [
+			["provider", { ...compacted.providerContext, binding: { ...binding, provider: "other-provider" } }],
+			["api", { ...compacted.providerContext, binding: { ...binding, api: "openai-codex-responses" } }],
+			["model", { ...compacted.providerContext, binding: { ...binding, model: "other-model" } }],
+			[
+				"endpoint",
+				{
+					...compacted.providerContext,
+					binding: { ...binding, endpoint: "https://other.example.test/v1/compact" },
+				},
+			],
+			["protocol", { ...compacted.providerContext, binding: { ...binding, protocol: "openai-codex-remote-v2" } }],
+			[
+				"credential",
+				{
+					...compacted.providerContext,
+					binding: {
+						...binding,
+						credentialScopeHash: binding.credentialScopeHash.replace(/^./u, (character) =>
+							character === "0" ? "1" : "0",
+						),
+					},
+				},
+			],
+		];
+		for (const [bindingDimension, providerContext] of mismatches) {
+			await expect(runtime.assertCanConsumeProviderContext(model, providerContext)).rejects.toMatchObject({
+				code: "binding_mismatch",
+				bindingDimension,
+			});
+			const message = await runtime.streamSimple(model, { messages: [], providerContext }).result();
+			expect(message.stopReason).toBe("error");
+			expect(message.errorMessage).toBe("Native compaction context binding does not match the active provider.");
+			expect(message.diagnostics).toEqual([
+				expect.objectContaining({
+					type: "native_compaction",
+					details: { code: "binding_mismatch", bindingDimension },
+				}),
+			]);
+		}
+		expect(faux.nativeCompaction!.state.consumerCallCount).toBe(2);
+		expect(faux.state.callCount).toBe(1);
 	});
 
 	it("lets Pi AI reject unsafe caller options before Runtime reads them", async () => {

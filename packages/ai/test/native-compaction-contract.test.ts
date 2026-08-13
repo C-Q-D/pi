@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 import {
 	cloneAndFreezeJson,
 	cloneAndFreezeProviderContext,
+	createNativeCompactionBindingMismatchError,
 	createNativeCompactionError,
 	NativeCompactionError,
+	sanitizeNativeCompactionError,
 	validateNativeCompactionResult,
 } from "../src/index.ts";
 import type { NativeCompactionErrorCode } from "../src/types.ts";
@@ -247,5 +249,21 @@ describe("Sanitized Native Error", () => {
 		expect(JSON.stringify(error)).not.toContain(SENTINEL);
 		expect(String(error)).not.toContain(SENTINEL);
 		expect(error.stack).not.toContain(SENTINEL);
+	});
+
+	it("Binding mismatch only exposes and preserves a fixed safe dimension", () => {
+		const error = createNativeCompactionBindingMismatchError("endpoint");
+		const sanitized = sanitizeNativeCompactionError(error, "provider_error");
+		const forged = new NativeCompactionError("binding_mismatch", SENTINEL as unknown as "endpoint");
+		const sanitizedForged = sanitizeNativeCompactionError(forged, "provider_error");
+
+		expect(error).toMatchObject({ code: "binding_mismatch", bindingDimension: "endpoint" });
+		expect(sanitized).toMatchObject({ code: "binding_mismatch", bindingDimension: "endpoint" });
+		expect(error.message).toBe("Native compaction context binding does not match the active provider.");
+		expect(JSON.stringify(error)).not.toContain("https://");
+		expect(JSON.stringify(error)).not.toContain(SAFE_HASH);
+		expect(forged.bindingDimension).toBeUndefined();
+		expect(sanitizedForged.bindingDimension).toBeUndefined();
+		expect(JSON.stringify(sanitizedForged)).not.toContain(SENTINEL);
 	});
 });

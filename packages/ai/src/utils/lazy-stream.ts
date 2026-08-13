@@ -1,7 +1,10 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, Model } from "../types.ts";
 import { AssistantMessageEventStream } from "./event-stream.ts";
+import { getNativeCompactionErrorMetadata } from "./native-compaction.ts";
 
 function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMessage {
+	const timestamp = Date.now();
+	const nativeMetadata = getNativeCompactionErrorMetadata(error);
 	return {
 		role: "assistant",
 		content: [],
@@ -18,7 +21,23 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMe
 		},
 		stopReason: "error",
 		errorMessage: error instanceof Error ? error.message : String(error),
-		timestamp: Date.now(),
+		...(nativeMetadata === undefined
+			? {}
+			: {
+					diagnostics: [
+						{
+							type: "native_compaction",
+							timestamp,
+							details: {
+								code: nativeMetadata.code,
+								...(nativeMetadata.bindingDimension === undefined
+									? {}
+									: { bindingDimension: nativeMetadata.bindingDimension }),
+							},
+						},
+					],
+				}),
+		timestamp,
 	};
 }
 

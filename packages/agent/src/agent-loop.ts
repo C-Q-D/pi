@@ -9,6 +9,7 @@ import {
 	cloneAndFreezeProviderContext,
 	createNativeCompactionError,
 	EventStream,
+	type SimpleStreamOptions,
 	sanitizeNativeCompactionError,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -54,6 +55,36 @@ function cloneAgentContext(context: AgentContext): AgentContext {
 		messages: context.messages.slice(),
 		tools: context.tools?.slice(),
 		...(providerContext === undefined ? {} : { providerContext }),
+	};
+}
+
+function createProviderStreamOptions(
+	config: AgentLoopConfig,
+	apiKey: string | undefined,
+	signal: AbortSignal | undefined,
+): SimpleStreamOptions {
+	return {
+		...(config.temperature === undefined ? {} : { temperature: config.temperature }),
+		...(config.maxTokens === undefined ? {} : { maxTokens: config.maxTokens }),
+		...(signal === undefined ? {} : { signal }),
+		...(apiKey === undefined ? {} : { apiKey }),
+		...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+		...(config.transport === undefined ? {} : { transport: config.transport }),
+		...(config.cacheRetention === undefined ? {} : { cacheRetention: config.cacheRetention }),
+		...(config.sessionId === undefined ? {} : { sessionId: config.sessionId }),
+		...(config.onPayload === undefined ? {} : { onPayload: config.onPayload }),
+		...(config.onResponse === undefined ? {} : { onResponse: config.onResponse }),
+		...(config.headers === undefined ? {} : { headers: config.headers }),
+		...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+		...(config.websocketConnectTimeoutMs === undefined
+			? {}
+			: { websocketConnectTimeoutMs: config.websocketConnectTimeoutMs }),
+		...(config.maxRetries === undefined ? {} : { maxRetries: config.maxRetries }),
+		...(config.maxRetryDelayMs === undefined ? {} : { maxRetryDelayMs: config.maxRetryDelayMs }),
+		...(config.metadata === undefined ? {} : { metadata: config.metadata }),
+		...(config.env === undefined ? {} : { env: config.env }),
+		...(config.reasoning === undefined ? {} : { reasoning: config.reasoning }),
+		...(config.thinkingBudgets === undefined ? {} : { thinkingBudgets: config.thinkingBudgets }),
 	};
 }
 
@@ -437,11 +468,11 @@ async function streamAssistantResponse(
 	if (signal?.aborted) throw createNativeCompactionError("aborted");
 	const resolvedApiKey = dynamicApiKey || config.apiKey;
 
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
+	const response = await streamFunction(
+		config.model,
+		llmContext,
+		createProviderStreamOptions(config, resolvedApiKey, signal),
+	);
 	if (signal?.aborted) throw createNativeCompactionError("aborted");
 
 	let partialMessage: AssistantMessage | null = null;
